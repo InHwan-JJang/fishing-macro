@@ -12,3 +12,8 @@ new/
 
 # 개인 설정 (실제로는 %LOCALAPPDATA%\FishingMacro 에 저장되지만 혹시 모를 사본 방지)
 settings.json
+
+# Local capture history
+/history/
+
+/fishing-macro-history/

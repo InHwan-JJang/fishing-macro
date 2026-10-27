@@ -14,9 +14,12 @@
 
 import ctypes
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import queue
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -24,7 +27,11 @@ import tkinter as tk
 import traceback
 from collections import deque
 from ctypes import wintypes as wt
-from tkinter import messagebox, ttk
+from tkinter import messagebox, ttk, filedialog
+from pathlib import Path
+from history_storage import delete_past_files
+from fishing_history import DailyHistory, History, Observer, now_kst, next_reset
+from history_window import HistoryWindow
 
 APP_TITLE = "낚시 매크로"
 ICON_FILE = "fishing.ico"
@@ -50,6 +57,7 @@ UI_FONT = "Malgun Gothic"
 SETTINGS_FILE = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "FishingMacro", "settings.json")
 CLIPBOARD_PRIVATE_FORMATS = ("ExcludeClipboardContentFromMonitorProcessing", "CanIncludeInClipboardHistory",
                              "CanUploadToCloudClipboard")
+LOG = logging.getLogger("FishingMacro")
 WAIT_MESSAGES = {
     "window": "채팅방을 다시 클릭하면 계속합니다",
     "keys": "Shift·Ctrl·Alt를 떼면 계속합니다",
@@ -150,6 +158,8 @@ RegisterHotKey = _api(user32, "RegisterHotKey", wt.BOOL, wt.HWND, ctypes.c_int, 
 UnregisterHotKey = _api(user32, "UnregisterHotKey", wt.BOOL, wt.HWND, ctypes.c_int)
 GetMessageW = _api(user32, "GetMessageW", wt.BOOL, ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT)
 PeekMessageW = _api(user32, "PeekMessageW", wt.BOOL, ctypes.POINTER(wt.MSG), wt.HWND, wt.UINT, wt.UINT, wt.UINT)
+TranslateMessage = _api(user32, "TranslateMessage", wt.BOOL, ctypes.POINTER(wt.MSG))
+DispatchMessageW = _api(user32, "DispatchMessageW", wt.LPARAM, ctypes.POINTER(wt.MSG))
 PostThreadMessageW = _api(user32, "PostThreadMessageW", wt.BOOL, wt.DWORD, wt.UINT, wt.WPARAM, wt.LPARAM)
 OpenClipboard = _api(user32, "OpenClipboard", wt.BOOL, wt.HWND)
 EmptyClipboard = _api(user32, "EmptyClipboard", wt.BOOL)
@@ -408,13 +418,16 @@ def _open_clipboard():
 def get_clipboard_text():
     """클립보드의 글. 글이 아니면 None."""
     if not _open_clipboard():
+        LOG.info("clipboard open failed error=%s", ctypes.get_last_error())
         return None
     try:
         handle = GetClipboardData(CF_UNICODETEXT)
         if not handle:
+            LOG.info("clipboard data unavailable error=%s", ctypes.get_last_error())
             return None
         ptr = GlobalLock(handle)
         if not ptr:
+            LOG.info("clipboard lock failed error=%s", ctypes.get_last_error())
             return None
         try:
             return ctypes.wstring_at(ptr)
@@ -449,6 +462,33 @@ def set_clipboard(text):
         CloseClipboard()
 
 
+def pump_thread_messages():
+    """Service this worker's input queue after AttachThreadInput/SetFocus.
+
+    Without pumping, Kakao's queued copy can stay blocked until the next
+    AttachThreadInput call, even though SendInput itself reported success.
+    """
+    msg = wt.MSG()
+    while PeekMessageW(ctypes.byref(msg), None, 0, 0, 1):  # PM_REMOVE
+        TranslateMessage(ctypes.byref(msg))
+        DispatchMessageW(ctypes.byref(msg))
+
+
+def wait_for_copied_text(before, timeout=3.0):
+    """Clipboard may be emptied before Kakao finishes preparing a large copy."""
+    deadline = time.monotonic() + timeout
+    LOG.info("clipboard wait before=%s current=%s", before, GetClipboardSequenceNumber())
+    while time.monotonic() < deadline:
+        pump_thread_messages()
+        if GetClipboardSequenceNumber() != before:
+            text = get_clipboard_text()
+            if text is not None:
+                return text
+        time.sleep(0.05)
+    LOG.info("clipboard wait timeout before=%s current=%s", before, GetClipboardSequenceNumber())
+    return None
+
+
 def copy_chat(room):
     """채팅방의 대화 내용을 전체 선택·복사해 글로 돌려줍니다. 사용자의 클립보드(글)는 되돌립니다. 실패하면 None."""
     chat_list, edit = find_child(room, LIST_CLASS), find_child(room, EDIT_CLASS)
@@ -457,21 +497,26 @@ def copy_chat(room):
     saved = get_clipboard_text()
     before = GetClipboardSequenceNumber()
     text = None
+    focus_ok = False
+    keys_ok = False
     try:
-        if focus_control(chat_list):
-            press_keys(VK_CONTROL, VK_A)
+        focus_ok = focus_control(chat_list)
+        if focus_ok:
+            selected = press_keys(VK_CONTROL, VK_A)
             time.sleep(0.1)
-            press_keys(VK_CONTROL, VK_C)
-            for _ in range(20):
-                if GetClipboardSequenceNumber() != before:
-                    text = get_clipboard_text()
-                    break
-                time.sleep(0.05)
+            keys_ok = press_keys(VK_CONTROL, VK_C) and selected
+            # Detach/reattach focus synchronization lets Kakao finish queued
+            # keyboard input. Waiting before restoring focus can stall copying.
+            if edit:
+                focus_control(edit)
+            text = wait_for_copied_text(before)
     finally:
         if edit:
             focus_control(edit)
         if saved is not None and text is not None:
             set_clipboard(saved)
+    LOG.info("copy focus=%s keys=%s changed=%s chars=%s", focus_ok, keys_ok,
+             GetClipboardSequenceNumber() != before, len(text) if text is not None else None)
     return text
 
 
@@ -510,7 +555,9 @@ def classify_reply(body):
         return ("extra",)
     achieve = ACHIEVE_RE.search(body)
     achieved = _num(achieve.group(1)) if achieve else None
-    if "낚시 성공" in body:
+    if "잔향을 마주쳤" in body or "일일 낚시 완료!" in body:
+        return ("extra",)
+    if "낚시 성공" in body or "대어 출현" in body or "진주 발견" in body:
         m = TODAY_RE.search(body)
         if m:
             return ("success", _num(m.group(1)), _num(m.group(2)), achieved)
@@ -622,7 +669,7 @@ class GlobalHotkeys(threading.Thread):
 class MacroJob:
     """낚시 채팅방에서 낚시 명령을 반복하고 봇 답장을 읽습니다."""
 
-    def __init__(self, target, user, repeat, auto):
+    def __init__(self, target, user, repeat, auto, history=None, bait=False):
         self.target, self.user, self.repeat, self.auto = target, user, repeat, auto
         self.done = 0                # 이번 실행에서 끝낸 반복 수
         self.today = None            # 봇이 알려 준 오늘 낚시 횟수
@@ -631,8 +678,13 @@ class MacroJob:
         self.waiting = None
         self.end_reason = None       # "finished" | "limit" | "target_closed"
         self.error = None
+        self.observer = Observer(history if history is not None else History(), user)
+        self.bait = bait
+        self.bait_status = ""
+        self.day = now_kst().date()
         self.cycle_s = 3 * GAP_S + WAIT_S + 0.3
         self._last_enter = 0.0
+        self._last_command = None
         self._limit_seen = False     # 한도 직전 반복에서 '달성 보상'·'추가 낚시' 메시지를 봄
         self._fresh_cycle = True
         self._clears_after_send = False
@@ -658,9 +710,22 @@ class MacroJob:
         try:
             if self._sleep(RESUME_DELAY_S, watch=True):
                 return
+            if not self._wait_until_ready():
+                return
+            initial = copy_chat(self.target)
+            if initial is None:
+                self.bait_status = "대화 읽기 실패 · 기록 시작 대기"
+                self.observer.awaiting_baseline = True
+            else:
+                self.observer.baseline(initial)
             started = time.perf_counter()
             cycles = 0
             while True:
+                if now_kst().date() != self.day:
+                    self.day = now_kst().date()
+                    self.today = self.limit = None
+                    self._limit_seen = False
+                    self.observer.today = self.observer.limit = None
                 self._fresh_cycle = True
                 if not self._command(TEXT_FISH):
                     return
@@ -668,6 +733,8 @@ class MacroJob:
                 if reply is None:
                     return
                 kind = reply[0] if reply else "none"
+                if self.observer.today is not None and self.observer.limit is not None:
+                    self.today, self.limit = self.observer.today, self.observer.limit
                 if kind == "success":
                     self.auto_releases = 0
                     if reply[1] is not None:
@@ -680,7 +747,16 @@ class MacroJob:
                 self.cycle_s = (time.perf_counter() - started) / cycles
                 if kind not in ("cooldown", "extra"):
                     self.done += 1
-                if limit_hit(reply, self.limit) or self._limit_seen:
+                if limit_hit(reply, self.limit) or self._limit_seen or (self.today is not None and self.limit is not None and self.today >= self.limit):
+                    # Give the final raid/reward card time to arrive before ending the job.
+                    deadline = time.perf_counter() + 2.0
+                    while time.perf_counter() < deadline:
+                        if self._sleep(0.5):
+                            return
+                        if GetForegroundWindow() == self.target:
+                            text = copy_chat(self.target)
+                            if text:
+                                self.observer.observe(text)
                     self.limit = self.limit or DEFAULT_LIMIT
                     self.today = self.limit
                     self.end_reason = "limit"
@@ -688,6 +764,9 @@ class MacroJob:
                 if not self.auto and self.done >= self.repeat:
                     self.end_reason = "finished"
                     return
+                if self.bait and self.observer.buff_requests:
+                    if not self._use_bait(self.observer.buff_requests.popleft()):
+                        return
         except Exception:
             self.error = traceback.format_exc()
         finally:
@@ -695,6 +774,7 @@ class MacroJob:
 
     def _command(self, text):
         """"@" → Enter → text → Enter. 정지했거나 창이 닫혔으면 False."""
+        self._last_command = text
         if not self._send_text("@") or self._sleep(GAP_S, watch=True) or not self._press_enter("@"):
             return False
         if self._sleep(GAP_S, watch=True) or not self._send_text(text) or self._sleep(GAP_S, watch=True):
@@ -714,15 +794,13 @@ class MacroJob:
                 if GetForegroundWindow() == self.target:
                     text = copy_chat(self.target)
                     if text:
+                        self.observer.observe(text)
                         replies = my_replies(text, self.user)
                         if self._near_limit() and limit_hit_after_my_command(text, self.user, self.limit):
                             self._limit_seen = True    # 3000번째는 답장이 둘(성공+달성)로 오기도 함
                         if replies and replies[-1][1] is not None and not self._stale(replies[-1][1]):
                             reply = replies[-1][1]
-                            # 한도 직전인데 답장에 횟수가 없으면, 뒤따라올 '달성' 메시지를 대기 끝까지 더 읽음
-                            if not (self._near_limit() and reply[0] == "success" and reply[1] is None
-                                    and not self._limit_seen):
-                                break
+                            # Keep reading until the deadline so the later fish card is recorded too.
                         fallback = latest_reply_after_my_command(text, self.user)
                 if time.perf_counter() >= deadline:
                     break
@@ -735,6 +813,34 @@ class MacroJob:
         if self._sleep(max(0.0, deadline - time.perf_counter()), watch=True):
             return None
         return reply
+
+    def _use_bait(self, maximum):
+        self.observer.bag_count = None
+        version = self.observer.bag_version
+        self._fresh_cycle = True
+        if not self._command("가방"):
+            return False
+        deadline = time.perf_counter() + 8.0
+        while time.perf_counter() < deadline:
+            if self._sleep(0.5) or not self._wait_until_ready():
+                return False
+            text = copy_chat(self.target)
+            if text:
+                self.observer.observe(text)
+            if self.observer.bag_version != version:
+                break
+        if self.observer.bag_count is None:
+            self.bait_status = "미끼 수량 확인 실패 · 낚시 재개"
+            return True
+        amount = min(maximum, self.observer.bag_count)
+        if not amount:
+            self.bait_status = "보유 미끼 없음"
+            return True
+        self._fresh_cycle = True
+        if not self._command(f"미끼 {amount}"):
+            return False
+        self.bait_status = f"미끼 {amount}개 사용 명령 전송"
+        return self._await_reply() is not None
 
     def _near_limit(self):
         return self.today is not None and self.limit is not None and self.today >= self.limit - 1
@@ -882,6 +988,38 @@ def save_settings(data):
 
 
 # ── 화면 ─────────────────────────────────────────────────────────────────
+class ToolTip:
+    def __init__(self, widget, text):
+        self.widget, self.text = widget, text
+        self.popup = None
+        self.timer = None
+        widget.bind("<Enter>", self.enter, add="+")
+        widget.bind("<Leave>", self.hide, add="+")
+        widget.bind("<ButtonPress>", self.hide, add="+")
+        widget.bind("<Destroy>", self.hide, add="+")
+
+    def enter(self, event=None):
+        self.hide()
+        self.timer = self.widget.after(450, self.show)
+
+    def show(self):
+        self.timer = None
+        self.popup = tk.Toplevel(self.widget)
+        self.popup.overrideredirect(True)
+        self.popup.attributes("-topmost", True)
+        self.popup.geometry(f"+{self.widget.winfo_rootx()+15}+{self.widget.winfo_rooty()+self.widget.winfo_height()+4}")
+        ttk.Label(self.popup, text=self.text, padding=8, wraplength=320,
+                  relief="solid", borderwidth=1).pack()
+
+    def hide(self, event=None):
+        if self.timer:
+            self.widget.after_cancel(self.timer)
+            self.timer = None
+        if self.popup:
+            self.popup.destroy()
+            self.popup = None
+
+
 class App:
     def __init__(self, root):
         self.root = root
@@ -891,6 +1029,16 @@ class App:
         self._notice_text, self._notice_until = "", 0.0
         self._esc_was_down = False
         self._poll_id = None
+        self.history_view = None
+        self.history_directory = Path(sys.executable if getattr(sys, 'frozen', False) else __file__).resolve().parent / "fishing-macro-history"
+        self.history = DailyHistory(self.history_directory, self.history_directory.parent / "history")
+        self._next_save = 0.0
+        self._scheduled_at = None
+        self._schedule_pending = False
+        self._shutdown_at = None
+        self._job_scheduled = False
+        self._limit_completed = False
+        self._shutdown_deferred = False
         settings = load_settings()
 
         root.title(APP_TITLE)
@@ -962,10 +1110,150 @@ class App:
             row=4, column=0, columnspan=3, sticky="w")
 
         self.topmost_var = tk.BooleanVar(value=bool(settings.get("topmost", True)))
-        ttk.Checkbutton(frame, text="항상 위에 표시", variable=self.topmost_var, command=self._apply_topmost).grid(
+        ttk.Checkbutton(frame, text="항 상 위에 표시", variable=self.topmost_var, command=self._apply_topmost).grid(
             row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
         self._apply_topmost()
         self._apply_auto()
+        self.schedule_var = tk.BooleanVar(value=bool(settings.get("schedule", False)))
+        self.bait_var = tk.BooleanVar(value=bool(settings.get("bait", False)))
+        # Shutdown is deliberately opt-in for each application session.
+        self.shutdown_var = tk.BooleanVar(value=False)
+        schedule_check = ttk.Checkbutton(frame, text="다음 날 자동 시작 예약", variable=self.schedule_var,
+                        command=self._arm_schedule)
+        schedule_check.grid(row=6, column=0, columnspan=3, sticky="w")
+        bait_check = ttk.Checkbutton(frame, text="행운 부여 시 미끼 자동 사용", variable=self.bait_var)
+        bait_check.grid(row=7, column=0, columnspan=3, sticky="w")
+        shutdown_check = ttk.Checkbutton(frame, text="PC 자동 종료", variable=self.shutdown_var,
+                                         command=self._update_shutdown_policy)
+        shutdown_check.grid(row=8, column=0, columnspan=3, sticky="w")
+        self.tooltips = [ToolTip(schedule_check, "오전 12시에 시작"),
+                         ToolTip(bait_check, "행운 어종을 낚은걸 감지하여 미끼를 자동으로 사용"),
+                         ToolTip(shutdown_check, "일일 낚시 완료 후, 자동 종료 여부. 다음날 예약이 되어있다면, 다음날 일일 낚시까지 완료 후 종료")]
+        self.schedule_label = ttk.Label(frame, text="", style="Detail.TLabel")
+        self.schedule_label.grid(row=9, column=0, columnspan=3, sticky="w")
+        ttk.Button(frame, text="히스토리 / 통계", command=self.show_history).grid(row=10, column=0, columnspan=2, sticky="ew", pady=6)
+        ttk.Button(frame, text="종료", command=self.close).grid(row=10, column=2, sticky="ew", pady=6)
+        self._arm_schedule()
+
+    def show_history(self):
+        if self.history_view and self.history_view.window.winfo_exists():
+            self.history_view.window.lift()
+        else:
+            self.history_view = HistoryWindow(self.root, self.history, self.load_history, self.delete_history,
+                                              lambda: self.job is not None or self._dialog_open)
+
+    def _arm_schedule(self):
+        self._scheduled_at = next_reset(now_kst()) if self.schedule_var.get() else None
+        if not self.schedule_var.get():
+            self._schedule_pending = False
+        self._update_shutdown_policy()
+
+    def cancel_shutdown(self):
+        self.shutdown_var.set(False)
+        self._shutdown_deferred = False
+        self._shutdown_at = None
+        self._notice("PC 자동 종료를 취소했습니다")
+
+    def _update_shutdown_policy(self):
+        if not self.shutdown_var.get():
+            self._shutdown_at = None
+            self._shutdown_deferred = False
+            return
+        if self.job or not self._limit_completed:
+            return
+        if not self._job_scheduled and (self.schedule_var.get() or self._schedule_pending):
+            self._shutdown_at = None
+            self._shutdown_deferred = True
+            return
+        self._shutdown_deferred = False
+        if self._job_scheduled:
+            # The reserved run is the final run, even if the daily checkbox stayed on.
+            self.schedule_var.set(False)
+            self._save_options()
+            self._scheduled_at = None
+            self._schedule_pending = False
+        if self._shutdown_at is None:
+            self._shutdown_at = time.monotonic() + 60
+
+    def _persist_history(self):
+        if self.history.save():
+            return True
+        self._notice("히스토리 자동 저장 실패 · 폴더 권한과 디스크 공간을 확인하세요", 10)
+        return False
+
+    def load_history(self):
+        if self.job or self._dialog_open:
+            return
+        self._dialog_open = True
+        try:
+            path = filedialog.askopenfilename(parent=self.history_view.window,
+                title="히스토리 불러오기", initialdir=str(self.history_directory),
+                filetypes=[("낚시 히스토리", "*.csv *.json")])
+            if path and not self.job:
+                loaded = History.load(path)
+                self.history_view.set_history(loaded, path)
+        except (OSError, ValueError, UnicodeError) as error:
+            messagebox.showerror("불러오기 실패", str(error), parent=self.history_view.window)
+        finally:
+            self._dialog_open = False
+
+    def delete_history(self):
+        if self.job or self._dialog_open:
+            return
+        self._dialog_open = True
+        try:
+            paths = filedialog.askopenfilenames(parent=self.history_view.window,
+                title="영구 삭제할 지난 히스토리 선택", initialdir=str(self.history_directory),
+                filetypes=[("CSV", "*.csv")])
+            if not paths:
+                return
+            if not messagebox.askyesno("지난 히스토리 영구 삭제",
+                    "다음 파일을 영구 삭제합니다. 복구할 수 없습니다.\n\n" +
+                    "\n".join(Path(p).name for p in paths), parent=self.history_view.window):
+                return
+            delete_past_files(paths, self.history_directory, self.history.path)
+            source = self.history_view.source_path
+            if source and Path(source).resolve() in [Path(p).resolve() for p in paths]:
+                self.history_view.show_current()
+        except (OSError, ValueError) as error:
+            messagebox.showerror("삭제 실패", str(error), parent=self.history_view.window)
+        finally:
+            self._dialog_open = False
+
+    def _timers(self):
+        if hasattr(self, "history"):
+            self.history.ensure_day()
+        now = now_kst()
+        if self._scheduled_at and now >= self._scheduled_at:
+            self._scheduled_at = next_reset(now)
+            self._schedule_pending = True
+            self._shutdown_at = None
+            if self.job:
+                self.job.stop()  # Wait for the old worker to exit before starting a new one.
+        if self._schedule_pending and not self.job and not self._dialog_open:
+            self._schedule_pending = False
+            self.start(scheduled=True)
+        if time.monotonic() >= self._next_save:
+            self._persist_history()
+            self._next_save = time.monotonic() + 5
+        if self._shutdown_at is not None:
+            left = max(0, int(self._shutdown_at - time.monotonic()))
+            self.schedule_label.configure(text=f"PC 종료까지 {left}초 · PC 자동 종료 체크 해제로 취소")
+            if time.monotonic() >= self._shutdown_at:
+                self._shutdown_at = None
+                if self._persist_history():
+                    try:
+                        result = subprocess.run([os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "shutdown.exe"), "/s", "/t", "0"],
+                                                creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True)
+                        if result.returncode:
+                            self._notice("PC 종료 요청 실패", 10)
+                    except OSError as error:
+                        self._error_dialog(str(error))
+        else:
+            text = f"다음 예약: {self._scheduled_at:%m/%d %H:%M:%S}" if self._scheduled_at else "자정 예약 꺼짐"
+            if self._shutdown_deferred:
+                text += " · 예약 낚시 완료 후 PC 종료"
+            self.schedule_label.configure(text=text)
 
     def _apply_auto(self):
         self.repeat_box.configure(state="disabled" if self.auto_var.get() or self.job else "normal")
@@ -985,16 +1273,22 @@ class App:
             raise ValueError(f"횟수는 {REPEAT_RANGE[0]} ~ {REPEAT_RANGE[1]:,} 사이로 입력하세요.")
         return dict(user=user, repeat=repeat, auto=self.auto_var.get())
 
+    def _save_options(self):
+        save_settings(dict(self._settings(), topmost=self.topmost_var.get(),
+                           schedule=self.schedule_var.get(), bait=self.bait_var.get()))
+
     # ── 동작 ─────────────────────────────────────────────────────────────
-    def start(self):
-        if self.job:
+    def start(self, scheduled=False):
+        if self.job or self._dialog_open:
             return
         try:
             settings = self._settings()
         except ValueError as error:
             self._warn(str(error))
             return
-        save_settings(dict(settings, topmost=self.topmost_var.get()))
+        self._save_options()
+        if scheduled:
+            settings["auto"] = True
         room = find_fishing_room()
         if room is None:
             self._idle = ("채팅방 없음", f"'{ROOM_PREFIX}'로 시작하는 카톡 채팅방을 열어 주세요")
@@ -1006,14 +1300,25 @@ class App:
         if not bring_to_front(room):
             self._idle = ("시작 실패", "채팅방 창을 앞으로 가져오지 못했습니다. 한 번 클릭해 주세요")
             return
-        self.job = MacroJob(room, **settings)
+        self._shutdown_at = None
+        self._job_scheduled = scheduled
+        self._limit_completed = False
+        self._shutdown_deferred = False
+        if self.history_view and self.history_view.window.winfo_exists():
+            self.history_view.show_current()
+        self.job = MacroJob(room, **settings, history=self.history, bait=self.bait_var.get())
         self._set_busy(True)
 
     def stop(self):
-        job, self.job = self.job, None
+        self._shutdown_at = None
+        self._schedule_pending = False
+        job = self.job
         if job is None:
             return
         job.stop(wait=1.5)
+        if job.running:
+            return
+        self.job = None
         self._idle = (f"정지됨 · {self._progress(job)}", "")
         self._set_busy(False)
 
@@ -1021,12 +1326,19 @@ class App:
         self.stop() if self.job else self.start()
 
     def close(self):
+        self._shutdown_at = None
+        self._scheduled_at = None
+        self._schedule_pending = False
         try:
-            save_settings(dict(self._settings(), topmost=self.topmost_var.get()))
+            self._save_options()
         except ValueError:
             pass
         if self.job:
             self.job.stop(wait=1.5)
+            if self.job.running:
+                self.root.after(100, self.close)
+                return
+        self._persist_history()
         release_stuck_keys()
         self.hotkeys.stop()
         if self._poll_id:
@@ -1041,6 +1353,8 @@ class App:
             self._idle = (f"완료 · {progress}", "")
         elif job.end_reason == "limit":
             self._idle = (f"오늘 한도 도달 · {progress}", "")
+            self._limit_completed = True
+            self._update_shutdown_policy()
         elif job.end_reason == "target_closed":
             self._idle = (f"채팅방이 닫혀 정지 · {progress}", "")
         elif job.error:
@@ -1112,6 +1426,7 @@ class App:
                 self.toggle()
             if self.job and not self.job.running:
                 self._finish_job()
+            self._timers()
             if stuck_scans and not self.job:
                 release_stuck_keys()
             self._render_status()
@@ -1121,6 +1436,7 @@ class App:
     def _render_status(self):
         now = time.monotonic()
         job = self.job
+        countdown = ""
         if job:
             progress = self._progress(job)
             if job.waiting == "window":
@@ -1129,14 +1445,20 @@ class App:
                 status = f"실행 중 · {progress}"
                 left = job.remaining
                 detail = f"남은 시간 약 {format_duration(left * job.cycle_s)}" if left is not None else "오늘 횟수 확인 중"
+                if job.waiting == "reply" and job._last_command == TEXT_FISH:
+                    seconds = max(0.0, job._last_enter + WAIT_S - time.perf_counter())
+                    countdown = (f"{seconds:.1f}초 후 낚시를 실행합니다" if seconds > 0
+                                 else "낚시 결과를 확인하는 중")
             else:
                 status, detail = f"대기 중 · {progress}", WAIT_MESSAGES[job.waiting]
         else:
             status, detail = self._idle
         if stuck_scans:
             detail = "관리자 권한 창이 앞에 있어 키를 떼지 못함 · 다른 창을 클릭하세요"
+            countdown = ""
         if now < self._notice_until:
             detail = self._notice_text
+        detail += "\n" + countdown
         for var, text in ((self.status_var, status), (self.detail_var, detail)):
             if var.get() != text:
                 var.set(text)
@@ -1148,9 +1470,23 @@ class App:
 def main():
     if already_running():
         return
+    try:
+        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
+        handler = RotatingFileHandler(os.path.join(os.path.dirname(SETTINGS_FILE), "diagnostics.log"),
+                                      maxBytes=262144, backupCount=1, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        LOG.addHandler(handler)
+        LOG.setLevel(logging.INFO)
+    except OSError:
+        pass
     enable_dpi_awareness()
     root = tk.Tk()
-    App(root)
+    try:
+        App(root)
+    except (OSError, ValueError, UnicodeError) as error:
+        messagebox.showerror("히스토리 초기화 실패", f"기존 기록을 덮어쓰지 않았습니다.\n{error}", parent=root)
+        root.destroy()
+        return
     root.mainloop()
 
 
