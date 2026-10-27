@@ -1,0 +1,14 @@
+# 가상환경 / 빌드 부산물
+.venv/
+__pycache__/
+build/
+dist/
+new/
+*.spec
+
+# 실행 파일은 저장소에 넣지 않고 GitHub Releases로 배포
+*.exe
+*.zip
+
+# 개인 설정 (실제로는 %LOCALAPPDATA%\FishingMacro 에 저장되지만 혹시 모를 사본 방지)
+settings.json
