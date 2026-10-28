@@ -179,3 +179,18 @@ _command는 시작 기준 0.5초/1초 절대 목표 시각으로 입력하여 �
 _last_enter는 Enter 키 입력 시작 시각이며 _await_reply의 첫 검사와 만료는 각각 +0.5/+3초입니다.
 copy_chat의 선택적 deadline은 클립보드 접근 재시도 및 복사 대기에 전달됩니다.
 기존 입력창 포커스를 복사 대기 전에 복원하는 순서는 유지합니다.
+
+## 탭과 누적 수
+
+HistoryWindow의 Notebook은 7개 보기 탭을 제공하고 공통 Treeview를 갱신합니다.
+구간별 통계는 statistics=True의 별도 HistoryWindow이며 원본 history를 공유해 갱신합니다.
+make_rows는 필터 전에 날짜·사용자·어종별 누적 수를 계산한 복사본을 만듭니다. CSV 원본은 변경하지 않습니다.
+어종/구간 합계 행은 실제 그룹 수로 표시하며 모든 기본 정렬은 최신 time/id 순입니다.
+도감 탭은 collection 기록만 사용해 이후 일반 포획으로 완성 시각과 크기가 바뀌지 않습니다.
+행운 기록에는 소비뿐 아니라 각 효과의 granted도 포함합니다.
+
+## 평균 표시
+
+history_view.average_summaries가 원본 포획 기록을 대상으로 구간/등급/행운 소비 평균을 계산합니다.
+COLUMNS에서 average를 제거했고 행별 평균은 더 이상 계산하지 않습니다.
+등급 정렬 활성 여부를 HistoryWindow.refresh에서 전달하며 값은 detail 요약에 표시합니다.

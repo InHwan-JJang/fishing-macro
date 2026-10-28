@@ -1,9 +1,9 @@
 """Typed rows shared by history rendering and sorting; no desktop dependencies."""
 from fishing_history import GRADES, sale_percent, EFFECTS
 
-COLUMNS = ('time', 'band', 'today', 'species', 'grade', 'count', 'size', 'gold', 'average', 'exp', 'extra')
-LABELS = ('시간', '구간', '오늘 낚시', '어종 / 종류', '등급', '마릿수', '크기(cm)', '획득 골드', '평균 골드', '획득 EXP', '상세')
-MODES = ('모두보기', '시간순', '등급별', '구간별', '행운', '도감 완성', '자동어', '진주', '레이드')
+COLUMNS = ('time', 'band', 'today', 'species', 'grade', 'count', 'size', 'gold', 'exp', 'extra')
+LABELS = ('시간', '구간', '오늘 낚시', '어종 / 종류', '등급', '누적 수', '크기(cm)', '획득 골드', '획득 EXP', '상세')
+MODES = ('전체', '어종', '행운 기록', '진주', '도감 완성', '자동어', '레이드')
 
 
 def row_for(group, grouped=False):
@@ -37,37 +37,46 @@ def row_for(group, grouped=False):
     return dict(time=latest['time'][:19].replace('T', ' '), band=sale_percent(latest),
                 today=latest.get('today'), limit=latest.get('limit'),
                 species=latest.get('species', {'auto':'자동어', 'pearl':'진주', 'raid':'레이드'}.get(latest['kind'], '어종 미확인')),
-                grade=latest.get('grade', ''), count=len(group), size=latest.get('size'),
-                gold=sum(golds) if golds else None, average=sum(golds)/len(golds) if golds else None,
+                grade=latest.get('grade', ''), count=latest.get('_cumulative', len(group)), size=latest.get('size'),
+                gold=sum(golds) if golds else None,
                 exp=sum(exps) if exps else None, extra=' · '.join(detail) or '—')
 
 
 def make_rows(records, mode, grade='전체'):
-    fish = [r for r in records if r['kind'] == 'fish']
-    if mode in ('모두보기', '등급별', '구간별', '도감 완성'):
-        chosen = fish
+    counters = {}
+    annotated = []
+    for original in sorted(records, key=lambda r: (r['time'], r['id'])):
+        r = dict(original)
+        key = (r.get('user'), r['time'][:10], r['kind'],
+               r.get('species', r['id'] if r['kind'] == 'fish' else r['kind']))
+        counters[key] = counters.get(key, 0) + 1
+        r['_cumulative'] = counters[key]
+        annotated.append(r)
+    chosen = [r for r in annotated if grade == '전체' or r.get('grade') == grade]
+    if mode in ('어종', '구간별', '도감 완성'):
+        chosen = [r for r in chosen if r['kind'] == 'fish']
         if mode == '도감 완성':
-            completed = {r.get('species') for r in fish if r.get('collection')}
-            chosen = [r for r in fish if r.get('species') in completed]
-        chosen = [r for r in chosen if grade == '전체' or r.get('grade') == grade]
+            chosen = [r for r in chosen if r.get('collection')]
         groups = {}
         for r in chosen:
-            key = (r.get('species', '어종 미확인'),)
+            key = (r.get('user'), r['time'][:10], r.get('species', '어종 미확인'))
             if mode == '구간별':
-                key += (r['time'][:10], sale_percent(r))
+                key += (sale_percent(r),)
             groups.setdefault(key, []).append(r)
-        rows = [row_for(group, True) for group in groups.values()]
-        if mode == '등급별':
-            rows.sort(key=lambda r: (GRADES.index(r['grade']) if r['grade'] in GRADES else 99, r['species']))
-        elif mode == '구간별':
-            rows.sort(key=lambda r: (r['time'][:10], -(r['band'] if r['band'] is not None else -1), r['species']))
-        else:
-            rows.sort(key=lambda r: r['species'])
-        return rows
+        rows = []
+        for group in groups.values():
+            row = row_for(group, True)
+            if mode in ('어종', '구간별'):
+                row['count'] = len(group)
+            row['_order'] = max((r['time'], r['id']) for r in group)
+            rows.append(row)
+        return sorted(rows, key=lambda r:r['_order'], reverse=True)
     kind = {'자동어':'auto', '진주':'pearl', '레이드':'raid'}.get(mode)
-    chosen = [r for r in records if (not kind or r['kind'] == kind) and (grade == '전체' or r.get('grade') == grade)]
-    if mode == '행운':
-        chosen = [r for r in chosen if r.get('any_lucky', r.get('lucky'))]
+    if kind:
+        chosen = [r for r in chosen if r['kind'] == kind]
+    if mode == '행운 기록':
+        chosen = [r for r in chosen if r.get('any_lucky', r.get('lucky')) or
+                  any(r.get(f'{effect}_granted') for effect, _ in EFFECTS)]
     return [row_for([r]) for r in sorted(chosen, key=lambda r: (r['time'], r['id']), reverse=True)]
 
 
@@ -91,10 +100,38 @@ def display_row(row):
             values.append('—')
         elif column == 'band':
             values.append(f'{value}%')
-        elif column in ('size', 'average'):
+        elif column == 'size':
             values.append(f'{value:,.1f}')
         elif column in ('count', 'gold', 'exp'):
             values.append(f'{value:,}')
         else:
             values.append(value)
     return values
+
+
+def average_summaries(records, mode, grade='전체', grade_sorted=False):
+    """Per-catch weighted averages across species, only in meaningful contexts."""
+    if mode in ('진주', '자동어', '레이드', '도감 완성'):
+        return []
+    fish = [r for r in records if r['kind'] == 'fish' and
+            (grade == '전체' or r.get('grade') == grade)]
+    groups = {}
+    if mode == '구간별':
+        for r in fish:
+            band = sale_percent(r)
+            label = f"{r['time'][:10]} {str(band)+'%' if band is not None else '구간 미확인'}"
+            groups.setdefault(label, []).append(r)
+    elif mode == '행운 기록':
+        groups['행운 소비'] = [r for r in fish if r.get('any_lucky', r.get('lucky'))]
+    elif grade != '전체':
+        groups[grade] = fish
+    elif grade_sorted:
+        groups = {g: [r for r in fish if r.get('grade') == g] for g in GRADES}
+    result = []
+    for label, group in groups.items():
+        known = [r['gold'] for r in group if r.get('gold') is not None]
+        if not group and grade_sorted:
+            continue
+        average = f'{sum(known)/len(known):,.1f}G' if known else '—'
+        result.append(f"{label}: 판매합계 {sum(known):,}G · 평균 {average} (골드 확인 {len(known):,}마리)")
+    return result
