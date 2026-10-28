@@ -127,6 +127,8 @@ def average_summaries(records, mode, grade='전체', grade_sorted=False):
         groups[grade] = fish
     elif grade_sorted:
         groups = {g: [r for r in fish if r.get('grade') == g] for g in GRADES}
+    elif mode == '어종':
+        groups['전체 어종'] = fish
     result = []
     for label, group in groups.items():
         known = [r['gold'] for r in group if r.get('gold') is not None]

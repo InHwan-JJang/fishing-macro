@@ -6,15 +6,13 @@ from history_view import COLUMNS, LABELS, MODES, make_rows, sort_rows, display_r
 
 
 class HistoryWindow:
-    def __init__(self, parent, history, on_load=None, on_delete=None, is_busy=lambda: False, statistics=False):
-        self.statistics = statistics
-        self.stats_window = None
+    def __init__(self, parent, history, on_load=None, on_delete=None, is_busy=lambda: False):
         self.history = history
         self.current_history = history
         self.source_path = None
         self.is_busy = is_busy
         self.window = tk.Toplevel(parent)
-        self.window.title("구간별 통계" if statistics else "낚시 히스토리 · 오늘 기록")
+        self.window.title("낚시 히스토리 · 오늘 기록")
         self.window.geometry("1380x700")
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         self.timer = None
@@ -23,15 +21,15 @@ class HistoryWindow:
         self.sort_direction = 0
         controls = ttk.Frame(self.window, padding=8)
         controls.pack(fill="x")
-        self.mode = tk.StringVar(value="구간별" if statistics else "전체")
-        self.tabs = None
-        if not statistics:
-            self.tabs = ttk.Notebook(self.window, height=1)
-            for label in MODES:
-                self.tabs.add(ttk.Frame(self.tabs), text=label)
-            self.tabs.pack(fill="x", padx=8, before=controls)
-            self.tabs.bind("<<NotebookTabChanged>>", self.change_tab)
-            ttk.Button(controls, text="구간별 통계", command=self.show_statistics).pack(side="left", padx=(0, 10))
+        self.mode = tk.StringVar(value="전체")
+        self.tabs = ttk.Notebook(self.window, height=1)
+        for label in MODES:
+            self.tabs.add(ttk.Frame(self.tabs), text=label)
+        self.tabs.pack(fill="x", padx=8, before=controls)
+        self.tabs.bind("<<NotebookTabChanged>>", self.change_tab)
+        self.tabs.bind("<ButtonRelease-1>", self.tab_clicked, add="+")
+        self.statistics_button = ttk.Button(controls, text="구간별 통계", command=self.show_statistics)
+        self.statistics_button.pack(side="left", padx=(0, 10))
         self.grade = tk.StringVar(value="전체")
         for grade in ("전체",) + GRADES:
             ttk.Radiobutton(controls, text=grade, value=grade, variable=self.grade, command=self.refresh).pack(side="left", padx=3)
@@ -40,10 +38,6 @@ class HistoryWindow:
         self.load_button = ttk.Button(controls, text="히스토리 불러오기", command=on_load)
         self.load_button.pack(side="right", padx=4)
         ttk.Button(controls, text="오늘 히스토리", command=self.show_current).pack(side="right")
-        if statistics:
-            for child in controls.winfo_children():
-                if isinstance(child, ttk.Button):
-                    child.pack_forget()
         self.revenue = ttk.Label(self.window, padding=(8, 6), font=("Malgun Gothic", 13, "bold"))
         self.revenue.pack(fill="x")
         self.summary = ttk.Label(self.window, padding=8, wraplength=1020)
@@ -81,18 +75,19 @@ class HistoryWindow:
         self.mode.set(MODES[self.tabs.index(self.tabs.select())])
         self.refresh()
 
+    def tab_clicked(self, event):
+        # Clicking the already selected tab must also leave statistics mode.
+        try:
+            self.tabs.index(f"@{event.x},{event.y}")
+        except tk.TclError:
+            return
+        self.window.after_idle(self.change_tab)
+
     def show_statistics(self):
-        if self.stats_window and self.stats_window.window.winfo_exists():
-            self.stats_window.set_history(self.history, self.source_path)
-            self.stats_window.window.lift()
-        else:
-            self.stats_window = HistoryWindow(self.window, self.history, statistics=True)
-        self.stats_window.grade.set(self.grade.get())
-        self.stats_window.refresh()
+        self.mode.set("구간별")
+        self.refresh()
 
     def close(self):
-        if self.stats_window and self.stats_window.window.winfo_exists():
-            self.stats_window.close()
         if self.timer:
             self.window.after_cancel(self.timer)
         self.window.destroy()
@@ -102,12 +97,10 @@ class HistoryWindow:
 
     def set_history(self, history, path=None):
         self.history, self.source_path = history, path
-        self.window.title(("구간별 통계 · " if self.statistics else "낚시 히스토리 · ") + (str(path) if path else "오늘 기록"))
+        self.window.title("낚시 히스토리 · " + (str(path) if path else "오늘 기록"))
         self.footer.configure(text=(f"불러온 기록: {path} · 오늘 기록과 합쳐지지 않습니다." if path else
             "기록마다 실행 파일 옆 fishing-macro-history 폴더에 자동 저장됩니다. 미확인 값은 — 표시."))
         self.refresh()
-        if self.stats_window and self.stats_window.window.winfo_exists():
-            self.stats_window.set_history(history, path)
 
     def _update_row_height(self):
         # Theme defaults may stay at 20 pixels while DPI scales the font.
@@ -157,12 +150,15 @@ class HistoryWindow:
         unknown_fish = sum('species' not in r for r in fish)
         self.detail.configure(text=totals + f"\n어종 미확인 {unknown_fish}건 · 획득 EXP 미표기 {unknown_exp}건 (합계에서 제외)")
         mode, grade = self.mode.get(), self.grade.get()
+        self.statistics_button.state(["pressed" if mode == "구간별" else "!pressed"])
         rows = sort_rows(make_rows(all_records, mode, grade), self.sort_column, self.sort_direction)
         averages = average_summaries(all_records, mode, grade, self.sort_column == 'grade')
         if averages:
             self.detail.configure(text=self.detail.cget('text') + "\n" + ' · '.join(averages))
         for column, label in zip(COLUMNS, LABELS):
-            suffix = (' ▲' if self.sort_direction == 1 else ' ▼') if column == self.sort_column else ''
+            effective_column = self.sort_column or 'time'
+            effective_direction = self.sort_direction if self.sort_column else 2
+            suffix = (' ▲' if effective_direction == 1 else ' ▼') if column == effective_column else ''
             self.tree.heading(column, text=label + suffix)
         position = self.tree.yview()
         children = self.tree.get_children()

@@ -183,7 +183,7 @@ copy_chat의 선택적 deadline은 클립보드 접근 재시도 및 복사 대�
 ## 탭과 누적 수
 
 HistoryWindow의 Notebook은 7개 보기 탭을 제공하고 공통 Treeview를 갱신합니다.
-구간별 통계는 statistics=True의 별도 HistoryWindow이며 원본 history를 공유해 갱신합니다.
+구간별 통계는 동일 HistoryWindow의 mode를 구간별로 전환하여 표시합니다. Notebook의 기존 선택 탭을 다시 클릭해도 mode를 복원합니다.
 make_rows는 필터 전에 날짜·사용자·어종별 누적 수를 계산한 복사본을 만듭니다. CSV 원본은 변경하지 않습니다.
 어종/구간 합계 행은 실제 그룹 수로 표시하며 모든 기본 정렬은 최신 time/id 순입니다.
 도감 탭은 collection 기록만 사용해 이후 일반 포획으로 완성 시각과 크기가 바뀌지 않습니다.
@@ -194,3 +194,6 @@ make_rows는 필터 전에 날짜·사용자·어종별 누적 수를 계산한 
 history_view.average_summaries가 원본 포획 기록을 대상으로 구간/등급/행운 소비 평균을 계산합니다.
 COLUMNS에서 average를 제거했고 행별 평균은 더 이상 계산하지 않습니다.
 등급 정렬 활성 여부를 HistoryWindow.refresh에서 전달하며 값은 detail 요약에 표시합니다.
+
+기본 sort_column=None 상태의 유효 표시 정렬은 time/내림차순으로 해석하여 시간 ▼를 렌더링합니다.
+실제 정렬 데이터는 make_rows의 최신순을 사용하므로 기존 기본 정렬 복귀 동작을 유지합니다.

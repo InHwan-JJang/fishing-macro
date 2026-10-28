@@ -34,6 +34,7 @@ from fishing_history import DailyHistory, History, Observer, now_kst, next_reset
 from history_window import HistoryWindow
 
 APP_TITLE = "낚시 매크로"
+APP_VERSION = "1.1.0"
 ICON_FILE = "fishing.ico"
 ROOM_PREFIX = "낚시"            # 이 글자로 시작하는 카톡 채팅방을 찾음
 TEXT_FISH, TEXT_MANUAL = "낚시", "수동"
@@ -1151,6 +1152,8 @@ class App:
         self.schedule_label.grid(row=9, column=0, columnspan=3, sticky="w")
         ttk.Button(frame, text="히스토리 / 통계", command=self.show_history).grid(row=10, column=0, columnspan=2, sticky="ew", pady=6)
         ttk.Button(frame, text="종료", command=self.close).grid(row=10, column=2, sticky="ew", pady=6)
+        self.version_label = ttk.Label(frame, text=f"v{APP_VERSION}", font=(UI_FONT, 8), foreground="#666666")
+        self.version_label.grid(row=11, column=0, columnspan=3, sticky="e", pady=(0, 1))
         self._arm_schedule()
 
     def show_history(self):

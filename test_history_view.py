@@ -179,7 +179,7 @@ class ViewTests(unittest.TestCase):
         self.assertIn('평균 200.0G',average_summaries(records,'전체','일반')[0])
         self.assertIn('평균 200.0G',average_summaries(records,'어종',grade_sorted=True)[0])
         self.assertEqual(average_summaries(records,'전체'),[])
-        self.assertEqual(average_summaries(records,'어종'),[])
+        self.assertIn('전체 어종: 판매합계 600G · 평균 200.0G',average_summaries(records,'어종')[0])
         self.assertNotIn('average',COLUMNS)
 
     def test_luck_average_excludes_grant_only_and_counts_overlap_once(self):
@@ -226,25 +226,35 @@ class WindowTests(unittest.TestCase):
         finally:
             window.close(); root.destroy()
 
-    def test_tabs_and_separate_statistics_keep_sorting(self):
+    def test_statistics_switches_in_place_and_tabs_return(self):
         import tkinter as tk
         from history_window import HistoryWindow
         root=tk.Tk(); root.withdraw()
         h=History(); h.update(1,record(1,gold=30))
         window=HistoryWindow(root,h); window.window.withdraw()
         try:
+            root.update_idletasks()
             self.assertEqual(tuple(window.tabs.tab(tab,'text') for tab in window.tabs.tabs()),MODES)
-            self.assertEqual(window.mode.get(),'전체')
+            self.assertEqual(window.tree.heading('time')['text'],'시간 ▼')
             window.tabs.select(1); window.change_tab()
-            self.assertEqual(window.mode.get(),'어종')
+            root.update_idletasks()
             window.toggle_sort('count')
-            window.show_statistics(); window.stats_window.window.withdraw()
-            self.assertEqual(window.stats_window.mode.get(),'구간별')
-            self.assertIsNone(window.stats_window.tabs)
-            self.assertEqual(window.mode.get(),'어종')
+            children=tuple(window.window.winfo_children())
+            window.show_statistics()
+            self.assertEqual(window.mode.get(),'구간별')
+            self.assertEqual(tuple(window.window.winfo_children()),children)
             self.assertEqual(window.sort_column,'count')
-            window.stats_window.toggle_sort('gold')
-            self.assertEqual(window.stats_window.sort_column,'gold')
+            self.assertTrue(window.statistics_button.instate(['pressed']))
+            window.change_tab()  # Also used for clicking the already selected tab.
+            self.assertEqual(window.mode.get(),'어종')
+            self.assertFalse(window.statistics_button.instate(['pressed']))
+            window.show_statistics()
+            window.tabs.select(3); window.change_tab()
+            self.assertEqual(window.mode.get(),'진주')
+            window.toggle_sort('count'); window.toggle_sort('count')
+            self.assertEqual(window.tree.heading('time')['text'],'시간 ▼')
+            window.toggle_sort('time')
+            self.assertEqual(window.tree.heading('time')['text'],'시간 ▲')
         finally:
             window.close(); root.destroy()
 
