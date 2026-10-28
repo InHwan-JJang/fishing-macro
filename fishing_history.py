@@ -59,8 +59,10 @@ def parse_details(text):
     else:
         # A catch card need not have a physical length (e.g. equipment '9강').
         # Still consume its response slot so the next fish cannot inherit it.
-        card = re.search(r"^\[([^\]\n]+)\]([^\n]*)", text, re.MULTILINE)
-        if card and card[1].strip() not in GRADES:
+        # Skip the [grade] summary and keep looking for size-less cards.
+        card = next((match for match in re.finditer(r"^\[([^\]\n]+)\]([^\n]*)", text, re.MULTILINE)
+                     if match[1].strip() not in GRADES), None)
+        if card:
             data['species'] = card[1].strip()
             attribute = card[2].strip()
             if attribute:

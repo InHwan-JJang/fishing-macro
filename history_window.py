@@ -4,6 +4,7 @@ from tkinter import ttk, font as tkfont
 from fishing_history import GRADES, COLORS
 from history_view import COLUMNS, LABELS, MODES, make_rows, sort_rows, display_row, average_summaries
 from history_view import RAID_COLUMNS, RAID_LABELS, raid_rows, display_raid_row
+from history_view import grade_probabilities
 
 
 class HistoryWindow:
@@ -29,8 +30,6 @@ class HistoryWindow:
         self.tabs.pack(fill="x", padx=8, before=controls)
         self.tabs.bind("<<NotebookTabChanged>>", self.change_tab)
         self.tabs.bind("<ButtonRelease-1>", self.tab_clicked, add="+")
-        self.statistics_button = ttk.Button(controls, text="구간별 통계", command=self.show_statistics)
-        self.statistics_button.pack(side="left", padx=(0, 10))
         self.grade = tk.StringVar(value="전체")
         self.grade_buttons = []
         for grade in ("전체",) + GRADES:
@@ -48,6 +47,10 @@ class HistoryWindow:
         self.summary.pack(fill="x")
         self.detail = ttk.Label(self.window, padding=8, wraplength=1020)
         self.detail.pack(fill="x")
+        self.exclude_extra = tk.BooleanVar(value=False)
+        self.exclude_extra_button = ttk.Checkbutton(self.window, text='추가낚시 제외 (평균 계산)',
+            variable=self.exclude_extra, command=self.refresh)
+        self.exclude_extra_button.pack(anchor='w', padx=8)
         frame = ttk.Frame(self.window)
         frame.pack(fill="both", expand=True, padx=8, pady=8)
         self.columns = COLUMNS
@@ -88,8 +91,8 @@ class HistoryWindow:
         self.window.after_idle(self.change_tab)
 
     def show_statistics(self):
-        self.mode.set("구간별")
-        self.refresh()
+        self.tabs.select(MODES.index('구간'))
+        self.change_tab()
 
     def close(self):
         if self.timer:
@@ -165,14 +168,17 @@ class HistoryWindow:
         unknown_fish = sum('species' not in r for r in fish)
         self.detail.configure(text=totals + f"\n어종 미확인 {unknown_fish}건 · 획득 EXP 미표기 {unknown_exp}건 (합계에서 제외)")
         mode, grade = self.mode.get(), self.grade.get()
-        self.statistics_button.state(["pressed" if mode == "구간별" else "!pressed"])
         rows = sort_rows(make_rows(all_records, mode, grade), self.sort_column, self.sort_direction)
         if raid_mode:
             rows = sort_rows(raid_rows(all_records), self.sort_column, self.sort_direction)
             self.revenue.configure(text=f"레이드 보상 {sum_key(raids, 'gold'):,}G · 달성 보상 {sum_key(raids, 'bonus'):,}G")
             self.summary.configure(text=f"조우 {len(raids):,}회 · 총 데미지 {sum_key(raids, 'damage'):,} · 해신석 {sum_key(raids, 'stones'):,}개")
             self.detail.configure(text='월드 보스와 잔향을 구분하여 기록합니다. 미확인 값은 — 표시.')
-        averages = average_summaries(all_records, mode, grade, self.sort_column == 'grade')
+        probabilities = grade_probabilities(all_records, mode)
+        if probabilities:
+            self.detail.configure(text=self.detail.cget('text') + '\n' + '\n'.join(probabilities))
+        averages = average_summaries(all_records, mode, grade, self.sort_column == 'grade', self.exclude_extra.get())
+        self.exclude_extra_button.configure(state='normal' if mode in ('전체', '어종', '구간', '행운') else 'disabled')
         if averages:
             self.detail.configure(text=self.detail.cget('text') + "\n" + ' · '.join(averages))
         for column, label in zip(columns, labels):
