@@ -295,6 +295,12 @@ class WindowTests(unittest.TestCase):
             self.assertNotIn('▲',window.tree.heading('time')['text'])
             for mode in MODES:
                 window.mode.set(mode); window.refresh()
+            self.assertIn('레이드 보상',window.revenue.cget('text'))
+            from history_view import RAID_COLUMNS
+            self.assertEqual(window.tree['columns'], RAID_COLUMNS)
+            self.assertTrue(all(button.instate(['disabled']) for button in window.grade_buttons))
+            window.mode.set('전체'); window.refresh()
+            self.assertEqual(window.tree['columns'], COLUMNS)
             self.assertIn('총 판매수익',window.revenue.cget('text'))
         finally:
             window.close(); root.destroy()

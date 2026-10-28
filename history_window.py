@@ -3,6 +3,7 @@ import tkinter as tk
 from tkinter import ttk, font as tkfont
 from fishing_history import GRADES, COLORS
 from history_view import COLUMNS, LABELS, MODES, make_rows, sort_rows, display_row, average_summaries
+from history_view import RAID_COLUMNS, RAID_LABELS, raid_rows, display_raid_row
 
 
 class HistoryWindow:
@@ -31,8 +32,11 @@ class HistoryWindow:
         self.statistics_button = ttk.Button(controls, text="구간별 통계", command=self.show_statistics)
         self.statistics_button.pack(side="left", padx=(0, 10))
         self.grade = tk.StringVar(value="전체")
+        self.grade_buttons = []
         for grade in ("전체",) + GRADES:
-            ttk.Radiobutton(controls, text=grade, value=grade, variable=self.grade, command=self.refresh).pack(side="left", padx=3)
+            button = ttk.Radiobutton(controls, text=grade, value=grade, variable=self.grade, command=self.refresh)
+            button.pack(side="left", padx=3)
+            self.grade_buttons.append(button)
         self.delete_button = ttk.Button(controls, text="지난 히스토리 영구 삭제", command=on_delete)
         self.delete_button.pack(side="right")
         self.load_button = ttk.Button(controls, text="히스토리 불러오기", command=on_load)
@@ -132,9 +136,20 @@ class HistoryWindow:
 
     def refresh(self):
         all_records = self.history.snapshot()
+        raid_mode = self.mode.get() == '레이드'
+        columns, labels = (RAID_COLUMNS, RAID_LABELS) if raid_mode else (COLUMNS, LABELS)
+        if self.columns != columns:
+            self.columns = columns
+            self.sort_column, self.sort_direction = None, 0
+            self.tree.configure(columns=columns)
+            for column, label in zip(columns, labels):
+                self.tree.heading(column, text=label, command=lambda c=column: self.toggle_sort(c))
+                self.tree.column(column, width=165 if column in ('time', 'boss_name') else 110, minwidth=45)
+        for button in self.grade_buttons:
+            button.configure(state='disabled' if raid_mode else 'normal')
         records = all_records
         self.version = self.history.version
-        grade = self.grade.get()
+        grade = '전체' if raid_mode else self.grade.get()
         if grade != "전체":
             records = [r for r in records if r.get('grade') == grade]
         fish = [r for r in records if r["kind"] == "fish"]
@@ -152,10 +167,15 @@ class HistoryWindow:
         mode, grade = self.mode.get(), self.grade.get()
         self.statistics_button.state(["pressed" if mode == "구간별" else "!pressed"])
         rows = sort_rows(make_rows(all_records, mode, grade), self.sort_column, self.sort_direction)
+        if raid_mode:
+            rows = sort_rows(raid_rows(all_records), self.sort_column, self.sort_direction)
+            self.revenue.configure(text=f"레이드 보상 {sum_key(raids, 'gold'):,}G · 달성 보상 {sum_key(raids, 'bonus'):,}G")
+            self.summary.configure(text=f"조우 {len(raids):,}회 · 총 데미지 {sum_key(raids, 'damage'):,} · 해신석 {sum_key(raids, 'stones'):,}개")
+            self.detail.configure(text='월드 보스와 잔향을 구분하여 기록합니다. 미확인 값은 — 표시.')
         averages = average_summaries(all_records, mode, grade, self.sort_column == 'grade')
         if averages:
             self.detail.configure(text=self.detail.cget('text') + "\n" + ' · '.join(averages))
-        for column, label in zip(COLUMNS, LABELS):
+        for column, label in zip(columns, labels):
             effective_column = self.sort_column or 'time'
             effective_direction = self.sort_direction if self.sort_column else 2
             suffix = (' ▲' if effective_direction == 1 else ' ▼') if column == effective_column else ''
@@ -165,6 +185,6 @@ class HistoryWindow:
         if children:
             self.tree.delete(*children)
         for row in rows:
-            self.insert(display_row(row), row['grade'])
+            self.insert(display_raid_row(row) if raid_mode else display_row(row), row.get('grade', ''))
         if position:
             self.tree.yview_moveto(position[0])

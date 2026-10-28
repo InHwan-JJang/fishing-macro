@@ -69,11 +69,23 @@ def parse_details(text):
         data["grade"] = grade[1]
     if "도감 완성!" in text and "최대 크기" in text:
         data["collection"] = True
+    world_boss = re.search(r"(?:^|\n|@\S+\s+)월드\s*보스\s+([^\n]+)", text)
+    echo_boss = re.search(r"(?:^|\n|@\S+\s+)([^\n@]+?의 잔향)(?:을 마주쳤|\s*$)", text, re.MULTILINE)
+    if world_boss:
+        data.update(raid_type='월드 보스', boss_name=re.sub(r'\s+조우[!！]?.*$', '', world_boss[1]).strip())
+        damage = number(text, r"([\d,]+)\s*데미지")
+        if damage is not None:
+            data.setdefault('damage', damage)
+        hp = re.search(r"HP\s*\[[^\]\n]*\]\s*([\d.]+)%\s*\n([\d,]+)\s*/\s*([\d,]+)", text)
+        if hp:
+            data.update(hp_percent=float(hp[1]), hp_current=int(hp[2].replace(',', '')), hp_max=int(hp[3].replace(',', '')))
+    elif echo_boss:
+        data.update(raid_type='잔향', boss_name=echo_boss[1].strip())
     if "자동어" in text:
         data["kind"] = "auto"
-    elif "잔향 피해" in text or "레이드" in text or "잔향을 마주쳤" in text:
+    elif world_boss or echo_boss or "잔향 피해" in text or "레이드" in text or "잔향을 마주쳤" in text:
         data["kind"] = "raid"
-        reward = number(text, r"잔향 보상:\s*([\d,]+)G")
+        reward = number(text, r"(?:잔향 보상|즉시 보상):\s*([\d,]+)G")
         if reward is not None:
             data.setdefault("gold", reward)
     elif "진주 발견" in text or "pearls" in data:
@@ -316,9 +328,9 @@ class Observer:
                 # A result without a corresponding command must not overwrite
                 # the preceding player's catch (e.g. a missed command).
                 self.active = None
-        elif details.get("species") or "pearls" in details or "damage" in details or "미끼:" in body:
+        elif details.get("species") or "pearls" in details or "damage" in details or "boss_name" in details or "미끼:" in body:
             card_kind = ("fish" if "species" in details else "pearl" if "pearls" in details
-                         else "raid" if "damage" in details else "bag")
+                         else "raid" if "damage" in details or "boss_name" in details else "bag")
             candidates = [r for r in self.responses if not r["complete"] and
                           (r["kind"] == card_kind or
                            (r["kind"] is None and r["command"] == "낚시" and card_kind in ("fish", "pearl", "raid")) or
@@ -357,6 +369,7 @@ class Observer:
             data.setdefault("today", (self.today or 0) + 1)
         if data.get("kind") == "raid" and self.limit:
             data.setdefault("today", self.limit)
+            data.setdefault("limit", self.limit)
         data["user"] = owner
         self.history.update(key, data)
         current = next((r for r in self.history.snapshot() if r['id'] == key), {})

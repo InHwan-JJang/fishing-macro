@@ -4,6 +4,20 @@ from fishing_history import GRADES, sale_percent, EFFECTS
 COLUMNS = ('time', 'band', 'today', 'species', 'grade', 'count', 'size', 'gold', 'exp', 'extra')
 LABELS = ('시간', '구간', '오늘 낚시', '어종 / 종류', '등급', '누적 수', '크기(cm)', '획득 골드', '획득 EXP', '상세')
 MODES = ('전체', '어종', '행운 기록', '진주', '도감 완성', '자동어', '레이드')
+RAID_COLUMNS = ('time', 'boss_name', 'raid_type', 'damage', 'gold', 'stones', 'bonus', 'hp_current', 'hp_max', 'hp_percent')
+RAID_LABELS = ('시간', '보스명', '조우 유형', '데미지', '보상 골드', '해신석', '달성 보상 골드', '남은 HP', '최대 HP', 'HP(%)')
+
+
+def raid_rows(records):
+    return [{key: (r['time'][:19].replace('T', ' ') if key == 'time' else r.get(key))
+             for key in RAID_COLUMNS}
+            for r in sorted(records, key=lambda r: (r['time'], r['id']), reverse=True)
+            if r['kind'] == 'raid']
+
+
+def display_raid_row(row):
+    return ['—' if row[key] is None else f'{row[key]:,}' if isinstance(row[key], (int, float)) else row[key]
+            for key in RAID_COLUMNS]
 
 
 def row_for(group, grouped=False):
@@ -11,6 +25,8 @@ def row_for(group, grouped=False):
     golds = [r['gold'] for r in group if 'gold' in r]
     exps = [r['exp'] for r in group if 'exp' in r]
     detail = []
+    if latest.get('boss_name'):
+        detail.append(latest.get('raid_type', '레이드') + ': ' + latest['boss_name'])
     for key, title in (('pearls', '진주'), ('damage', '데미지'), ('stones', '해신석'), ('bonus', '달성 보상 G')):
         if any(key in r for r in group):
             detail.append(f"{title} {sum(r.get(key, 0) for r in group):,}")
@@ -36,7 +52,7 @@ def row_for(group, grouped=False):
         detail.append(latest['card_attribute'])
     return dict(time=latest['time'][:19].replace('T', ' '), band=sale_percent(latest),
                 today=latest.get('today'), limit=latest.get('limit'),
-                species=latest.get('species', {'auto':'자동어', 'pearl':'진주', 'raid':'레이드'}.get(latest['kind'], '어종 미확인')),
+                species=latest.get('species', latest.get('boss_name', {'auto':'자동어', 'pearl':'진주', 'raid':'레이드'}.get(latest['kind'], '어종 미확인'))),
                 grade=latest.get('grade', ''), count=latest.get('_cumulative', len(group)), size=latest.get('size'),
                 gold=sum(golds) if golds else None,
                 exp=sum(exps) if exps else None, extra=' · '.join(detail) or '—')

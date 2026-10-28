@@ -10,9 +10,10 @@ FIELDS = ('id', 'time', 'user', 'kind', 'species', 'grade', 'size', 'today', 'li
           'gold', 'multiplier', 'balance', 'exp', 'pearls', 'damage', 'stones', 'bonus',
           'collection', 'luck_remaining', 'lucky', 'luck_granted', 'enhancement', 'card_attribute',
           'frost_remaining', 'fire_remaining', 'frost_active', 'fire_active',
-          'frost_granted', 'fire_granted', 'any_lucky')
+          'frost_granted', 'fire_granted', 'any_lucky',
+          'boss_name', 'raid_type', 'hp_current', 'hp_max', 'hp_percent')
 INTEGERS = {'id', 'today', 'limit', 'gold', 'multiplier', 'balance', 'exp', 'pearls',
-            'damage', 'stones', 'bonus', 'luck_remaining', 'enhancement', 'frost_remaining', 'fire_remaining'}
+            'damage', 'stones', 'bonus', 'luck_remaining', 'enhancement', 'frost_remaining', 'fire_remaining', 'hp_current', 'hp_max'}
 BOOLEANS = {'collection', 'lucky', 'luck_granted', 'frost_active', 'fire_active', 'frost_granted', 'fire_granted', 'any_lucky'}
 
 
@@ -63,9 +64,9 @@ def load_records(path):
                     value = int(str(value).replace(',', ''))
                     if value < 0:
                         raise ValueError(f'{key} 음수')
-                elif key == 'size':
+                elif key in ('size', 'hp_percent'):
                     value = float(value)
-                    if not math.isfinite(value) or value < 0:
+                    if not math.isfinite(value) or value < 0 or (key == 'hp_percent' and value > 100):
                         raise ValueError('크기 값 오류')
                 elif not isinstance(value, str):
                     raise ValueError(f'{key} 문자열 오류')
