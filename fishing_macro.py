@@ -34,7 +34,7 @@ from fishing_history import DailyHistory, History, Observer, now_kst, next_reset
 from history_window import HistoryWindow
 
 APP_TITLE = "낚시 매크로"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 ICON_FILE = "fishing.ico"
 ROOM_PREFIX = "낚시"            # 이 글자로 시작하는 카톡 채팅방을 찾음
 TEXT_FISH, TEXT_MANUAL = "낚시", "수동"

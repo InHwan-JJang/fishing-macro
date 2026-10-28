@@ -11,7 +11,7 @@
 | `test_history_view.py` | 행운 마지막 횟수·사용자 분리·표시·정렬·Tkinter 열 테스트 |
 | `test_fishing.py` | 파싱·중복 방지·미끼 수량·예약·종료 조건·복사 회귀 테스트 |
 | `build.bat` | 가상환경과 PyInstaller를 이용한 Windows EXE 빌드 |
-| `make_icon.py` | Pillow로 아이콘 생성 |
+| `make_icon.py` | 확정된 `images.png`를 Pillow로 Windows ICO로 변환 |
 
 런타임은 Python 표준 라이브러리와 Windows DLL을 사용합니다. 빌드에는 PyInstaller,
 아이콘 재생성에는 Pillow가 필요합니다. 서버나 OCR을 사용하지 않습니다.
