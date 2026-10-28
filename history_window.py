@@ -1,6 +1,6 @@
 """Read-only session history viewer."""
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, font as tkfont
 from fishing_history import GRADES, COLORS, sale_percent
 from history_view import COLUMNS, LABELS, MODES, make_rows, sort_rows, display_row
 
@@ -43,7 +43,12 @@ class HistoryWindow:
         frame = ttk.Frame(self.window)
         frame.pack(fill="both", expand=True, padx=8, pady=8)
         self.columns = COLUMNS
-        self.tree = ttk.Treeview(frame, columns=self.columns, show="headings")
+        self.table_style = ttk.Style(self.window)
+        self.table_font = tkfont.Font(root=self.window, font=self.table_style.lookup("Treeview", "font") or "TkDefaultFont")
+        self.table_style.configure("History.Treeview", font=self.table_font)
+        self._row_height = None
+        self._update_row_height()
+        self.tree = ttk.Treeview(frame, columns=self.columns, show="headings", style="History.Treeview")
         for name, label, width in zip(self.columns, LABELS,
                 (165, 60, 105, 130, 60, 65, 85, 95, 90, 90, 380)):
             self.tree.heading(name, text=label, command=lambda c=name: self.toggle_sort(c))
@@ -77,7 +82,15 @@ class HistoryWindow:
             "기록마다 실행 파일 옆 fishing-macro-history 폴더에 자동 저장됩니다. 미확인 값은 — 표시."))
         self.refresh()
 
+    def _update_row_height(self):
+        # Theme defaults may stay at 20 pixels while DPI scales the font.
+        height = self.table_font.metrics('linespace') + max(6, round(self.window.winfo_fpixels('4p')))
+        if height != self._row_height:
+            self.table_style.configure("History.Treeview", rowheight=height)
+            self._row_height = height
+
     def poll(self):
+        self._update_row_height()
         state = "disabled" if self.is_busy() else "normal"
         self.load_button.configure(state=state)
         self.delete_button.configure(state=state)

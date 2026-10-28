@@ -178,6 +178,24 @@ class WindowTests(unittest.TestCase):
         finally:
             window.close(); root.destroy()
 
+    def test_scaled_table_rows_fit_font(self):
+        import tkinter as tk
+        from history_window import HistoryWindow
+        root=tk.Tk(); root.withdraw()
+        try:
+            for scale in (1.0,1.5,2.0,2.5):
+                root.tk.call('tk','scaling',scale)
+                window=HistoryWindow(root,History()); window.window.withdraw()
+                try:
+                    window.table_font.configure(size=18)
+                    window._update_row_height()
+                    height=int(window.table_style.lookup('History.Treeview','rowheight'))
+                    self.assertGreaterEqual(height,window.table_font.metrics('linespace')+6)
+                finally:
+                    window.close()
+        finally:
+            root.destroy()
+
     def test_header_cycle_is_single_column_and_survives_refresh(self):
         import tkinter as tk
         from history_window import HistoryWindow

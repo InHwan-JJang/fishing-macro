@@ -175,6 +175,60 @@ class ObserverTests(unittest.TestCase):
         self.obs.observe(self.text)
         self.assertEqual(list(self.obs.buff_requests), [20])
 
+    def test_epic_strong_bite_cards_and_following_normal_catch(self):
+        for species, size, count, gold, exp in [('돌고래','207.5cm',2901,2197,118), ('대왕오징어','3.9m',2912,2500,133)]:
+            body=f'@사용자 강한 입질!\n획득 골드: {gold:,}G\n경험치: {exp}EXP (16,458 / 20,020)\n오늘 낚시: {count:,} / 3,000'
+            self.append('나','@방구석낚시꾼 낚시')
+            self.append('방구석낚시꾼',body)
+            self.assertEqual(macro.classify_reply(body), ('success',count,3000,None))
+            self.append('방구석낚시꾼', f'[{species}] {size}\n등급: 에픽')
+        self.catch('가자미')
+        rows=self.history.snapshot()
+        self.assertEqual([(r['species'],r['grade'],r['gold'],r['exp'],r['size']) for r in rows[:2]],
+                         [('돌고래','에픽',2197,118,207.5),('대왕오징어','에픽',2500,133,390)])
+        self.assertEqual(rows[2]['species'],'가자미')
+
+    def test_two_players_strong_bite_headers_then_cards(self):
+        self.append('친구','@방구석낚시꾼 낚시')
+        self.append('나','@방구석낚시꾼 낚시')
+        self.append('방구석낚시꾼','@사용자 강한 입질!\n획득 골드: 2,197G')
+        self.append('방구석낚시꾼','@사용자 강한 입질!\n획득 골드: 2,500G')
+        self.append('방구석낚시꾼','[돌고래] 207.5cm\n등급: 에픽')
+        self.append('방구석낚시꾼','[대왕오징어] 3.9m\n등급: 에픽')
+        rows=self.history.snapshot()
+        self.assertEqual(len(rows),1)
+        self.assertEqual((rows[0]['species'],rows[0]['gold']),('대왕오징어',2500))
+
+    def test_arbitrary_flavor_text_uses_result_structure(self):
+        for count, title in enumerate(('환상의 손맛!', '무언가 올라왔어요!', '오늘의 발견'), 1):
+            body=f'@사용자 {title}\n획득 골드: 100G\n경험치: 8EXP\n오늘 낚시: {count} / 3,000'
+            self.append('나','@방구석낚시꾼 낚시')
+            self.append('방구석낚시꾼',body)
+            self.append('방구석낚시꾼',f'[어종{count}] 1.5m\n등급: 에픽')
+            self.assertEqual(macro.classify_reply(body),('success',count,3000,None))
+        self.assertEqual([r['species'] for r in self.history.snapshot()],['어종1','어종2','어종3'])
+
+    def test_unclassified_header_retains_fifo_until_card(self):
+        self.append('친구','@방구석낚시꾼 낚시')
+        self.append('나','@방구석낚시꾼 낚시')
+        self.append('방구석낚시꾼','@사용자 처음 보는 문구!\n획득 골드: 50G')
+        self.append('방구석낚시꾼','@사용자 다른 문구!\n획득 골드: 70G')
+        self.append('방구석낚시꾼','[친구 물고기] 3cm\n등급: 일반')
+        self.append('방구석낚시꾼','[내 물고기] 4cm\n등급: 레어')
+        rows=self.history.snapshot()
+        self.assertEqual(len(rows),1)
+        self.assertEqual((rows[0]['species'], rows[0]['gold']),('내 물고기',70))
+
+    def test_cooldown_is_not_a_pending_catch(self):
+        self.append('나','@방구석낚시꾼 낚시')
+        self.append('방구석낚시꾼','@사용자 아직 숨을 고르는 중입니다')
+        self.append('나','@방구석낚시꾼 낚시')
+        self.append('방구석낚시꾼','@사용자 새로운 문구!\n획득 골드: 70G')
+        self.append('방구석낚시꾼','[내 물고기] 4cm\n등급: 레어')
+        rows=self.history.snapshot()
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['gold'],70)
+
     def test_twenty_baits(self):
         self.catch('만년화리', '\n만년화리의 숨결: 남은 20회 대어 확률 +2.0%p')
         self.assertEqual(list(self.obs.buff_requests), [20])
@@ -436,6 +490,85 @@ class IntegrationTests(unittest.TestCase):
         app.job = Mock()
         app._update_shutdown_policy()
         self.assertIsNone(app._shutdown_at)
+
+    def test_reply_reads_during_wait_and_records_later_card(self):
+        import threading
+        job=macro.MacroJob.__new__(macro.MacroJob)
+        job._last_enter=0.0; job._stop_event=threading.Event()
+        job.target=1; job.user='나'; job.today=None; job.limit=None
+        history=History(); job.observer=Observer(history,'나')
+        job.observer.baseline('')
+        clock=[0.0]; reads=[]; observed=[]
+        def sleep(seconds,watch=False):
+            clock[0]+=seconds
+            return False
+        job._sleep=sleep
+        header=line('나','@방구석낚시꾼 낚시')+'\n'+line('방구석낚시꾼','@사용자 강한 입질!\n획득 골드: 2197G\n오늘 낚시: 2901 / 3000')
+        def copy(_, deadline=None):
+            reads.append(clock[0])
+            return header + ('\n'+line('방구석낚시꾼','[돌고래] 207.5cm\n등급: 에픽') if clock[0]>=1.2 else '')
+        original=job.observer.observe
+        def observe(text):
+            original(text)
+            if any(r.get('species')=='돌고래' for r in history.snapshot()): observed.append(clock[0])
+        job.observer.observe=observe
+        with patch.object(macro.time,'perf_counter',side_effect=lambda:clock[0]), patch.object(macro,'copy_chat',side_effect=copy), patch.object(macro,'GetForegroundWindow',return_value=1):
+            reply=job._await_reply()
+        self.assertEqual(reply[0],'success')
+        self.assertAlmostEqual(reads[0],0.5)
+        self.assertLess(observed[0],macro.WAIT_S)
+        self.assertGreater(len(reads),1)
+        self.assertAlmostEqual(clock[0],macro.WAIT_S)
+
+    def test_slow_copy_uses_remaining_budget_without_extra_wait(self):
+        import threading
+        job=macro.MacroJob.__new__(macro.MacroJob)
+        job._last_enter=0.0; job._stop_event=threading.Event()
+        job.target=1; job.user='나'; job.today=None; job.limit=None
+        job.observer=Mock()
+        # Sending confirmation already consumed 0.3 seconds.
+        clock=[0.3]; copies=[]
+        def sleep(seconds,watch=False):
+            clock[0]+=seconds
+            return False
+        job._sleep=sleep
+        def copy(_,deadline=None):
+            copies.append((clock[0],deadline))
+            clock[0]=deadline
+            return None
+        with patch.object(macro.time,'perf_counter',side_effect=lambda:clock[0]), patch.object(macro,'copy_chat',side_effect=copy), patch.object(macro,'GetForegroundWindow',return_value=1):
+            self.assertEqual(job._await_reply(),())
+        self.assertAlmostEqual(copies[0][0],0.5)
+        self.assertTrue(all(end<=2.8 for _,end in copies))
+        self.assertAlmostEqual(clock[0],3.0)
+
+    def test_four_second_command_cycle(self):
+        import threading
+        job=macro.MacroJob.__new__(macro.MacroJob)
+        job._stop_event=threading.Event(); job.target=1; job.user='나'
+        job.today=None; job.limit=None; job.observer=Mock()
+        clock=[0.0]; events=[]
+        def sleep(seconds,watch=False):
+            clock[0]+=seconds
+            return False
+        def send(text):
+            events.append((text,clock[0]))
+            clock[0]+=0.02  # typing time is included in the half-second slot
+            return True
+        def enter(text):
+            events.append(('Enter',clock[0]))
+            job._last_enter=clock[0]
+            clock[0]+=0.03  # confirmation time is included in reply waiting
+            return True
+        job._sleep=sleep; job._send_text=send; job._press_enter=enter
+        with patch.object(macro.time,'perf_counter',side_effect=lambda:clock[0]), patch.object(macro,'copy_chat',return_value=None), patch.object(macro,'GetForegroundWindow',return_value=1):
+            self.assertTrue(job._command('낚시'))
+            job._await_reply()
+            self.assertAlmostEqual(clock[0],4.0)
+        self.assertEqual(events[0],('@',0.0))
+        self.assertEqual(events[1],('Enter',0.5))
+        self.assertAlmostEqual(events[2][1],0.53)
+        self.assertEqual(events[3],('Enter',1.0))
 
     def test_bait_caps(self):
         for available, maximum, expected in [(30, 10, 10), (30, 20, 20), (7, 20, 7), (0, 20, 0)]:

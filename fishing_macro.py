@@ -1,7 +1,7 @@
 """낚시 매크로 - 카카오톡 낚시 봇 방에서 "@" → Enter → "낚시" → Enter 를 반복합니다.
 
 * [시작] 또는 F9: 제목이 "낚시"로 시작하는 카톡 채팅방 창을 찾아 앞으로 가져온 뒤 바로 시작합니다.
-* 한 번 반복: "@" → 500 ms → Enter → 500 ms → "낚시" → 500 ms → Enter → 봇 답장 확인 → 3초 대기
+* 한 번 반복: "@" → 500 ms → Enter → "낚시" → 500 ms → Enter → 3초 대기 중 봇 답장 확인
 * 반복할 때마다 채팅 내용을 복사(Ctrl+A, Ctrl+C)해 봇 답장을 읽습니다.
     - "오늘 낚시: N / M" 으로 오늘 횟수를 세고, 한도(M)에 닿으면 멈춥니다. (한도 넘겨 치면 정지당함)
     - "자동어"를 낚았으면 "@" → Enter → "수동" → Enter 로 풀고 계속합니다.
@@ -30,7 +30,7 @@ from ctypes import wintypes as wt
 from tkinter import messagebox, ttk, filedialog
 from pathlib import Path
 from history_storage import delete_past_files
-from fishing_history import DailyHistory, History, Observer, now_kst, next_reset
+from fishing_history import DailyHistory, History, Observer, now_kst, next_reset, parse_details
 from history_window import HistoryWindow
 
 APP_TITLE = "낚시 매크로"
@@ -41,7 +41,7 @@ GAP_S = 0.5                     # 키 사이 간격
 WAIT_S = 3.0                    # 반복 대기
 REPEAT_RANGE = (0, 9999)
 DEFAULT_REPEAT = 4000
-REPLY_FIRST_POLL_S = 0.7        # Enter 뒤 처음 채팅을 읽기까지 (봇 답장은 보통 1초 안에 옴)
+REPLY_FIRST_POLL_S = 0.5        # Enter 뒤 처음 채팅을 읽기까지 (봇 답장은 보통 1초 안에 옴)
 REPLY_POLL_S = 0.5              # 답장이 아직 없으면 이 간격으로 다시 읽음 (읽기 1회 ≈ 0.2초)
 MAX_AUTO_RELEASE = 3            # 자동어 해제를 연속으로 시도하는 최대 횟수
 KEY_HOLD_S = 0.03
@@ -407,17 +407,19 @@ def modifiers_held():
 
 
 # ── 클립보드 ─────────────────────────────────────────────────────────────
-def _open_clipboard():
+def _open_clipboard(deadline=None):
     for _ in range(50):
+        if deadline is not None and time.perf_counter() >= deadline:
+            return False
         if OpenClipboard(None):
             return True
         time.sleep(0.01)
     return False
 
 
-def get_clipboard_text():
+def get_clipboard_text(deadline=None):
     """클립보드의 글. 글이 아니면 None."""
-    if not _open_clipboard():
+    if not _open_clipboard(deadline):
         LOG.info("clipboard open failed error=%s", ctypes.get_last_error())
         return None
     try:
@@ -437,9 +439,9 @@ def get_clipboard_text():
         CloseClipboard()
 
 
-def set_clipboard(text):
+def set_clipboard(text, deadline=None):
     """클립보드에 text를 넣습니다. 클립보드 기록(Win+V)에는 남지 않게 표시합니다."""
-    if not _open_clipboard():
+    if not _open_clipboard(deadline):
         return False
     try:
         EmptyClipboard()
@@ -474,14 +476,16 @@ def pump_thread_messages():
         DispatchMessageW(ctypes.byref(msg))
 
 
-def wait_for_copied_text(before, timeout=3.0):
+def wait_for_copied_text(before, timeout=3.0, operation_deadline=None):
     """Clipboard may be emptied before Kakao finishes preparing a large copy."""
     deadline = time.monotonic() + timeout
     LOG.info("clipboard wait before=%s current=%s", before, GetClipboardSequenceNumber())
     while time.monotonic() < deadline:
+        if operation_deadline is not None and time.perf_counter() >= operation_deadline:
+            break
         pump_thread_messages()
         if GetClipboardSequenceNumber() != before:
-            text = get_clipboard_text()
+            text = get_clipboard_text(operation_deadline) if operation_deadline is not None else get_clipboard_text()
             if text is not None:
                 return text
         time.sleep(0.05)
@@ -489,12 +493,14 @@ def wait_for_copied_text(before, timeout=3.0):
     return None
 
 
-def copy_chat(room):
+def copy_chat(room, deadline=None):
     """채팅방의 대화 내용을 전체 선택·복사해 글로 돌려줍니다. 사용자의 클립보드(글)는 되돌립니다. 실패하면 None."""
     chat_list, edit = find_child(room, LIST_CLASS), find_child(room, EDIT_CLASS)
     if not chat_list or GetForegroundWindow() != room:
         return None
-    saved = get_clipboard_text()
+    if deadline is not None and time.perf_counter() >= deadline:
+        return None
+    saved = get_clipboard_text(deadline) if deadline is not None else get_clipboard_text()
     before = GetClipboardSequenceNumber()
     text = None
     focus_ok = False
@@ -509,12 +515,18 @@ def copy_chat(room):
             # keyboard input. Waiting before restoring focus can stall copying.
             if edit:
                 focus_control(edit)
-            text = wait_for_copied_text(before)
+            if deadline is None:
+                text = wait_for_copied_text(before)
+            else:
+                text = wait_for_copied_text(before, timeout=max(0, deadline-time.perf_counter()), operation_deadline=deadline)
     finally:
         if edit:
             focus_control(edit)
         if saved is not None and text is not None:
-            set_clipboard(saved)
+            if deadline is None:
+                set_clipboard(saved)
+            else:
+                set_clipboard(saved, deadline=deadline + 0.1)
     LOG.info("copy focus=%s keys=%s changed=%s chars=%s", focus_ok, keys_ok,
              GetClipboardSequenceNumber() != before, len(text) if text is not None else None)
     return text
@@ -557,7 +569,7 @@ def classify_reply(body):
     achieved = _num(achieve.group(1)) if achieve else None
     if "잔향을 마주쳤" in body or "일일 낚시 완료!" in body:
         return ("extra",)
-    if "낚시 성공" in body or "대어 출현" in body or "진주 발견" in body:
+    if TODAY_RE.search(body) or parse_details(body).get("kind") in ("fish", "pearl"):
         m = TODAY_RE.search(body)
         if m:
             return ("success", _num(m.group(1)), _num(m.group(2)), achieved)
@@ -682,7 +694,7 @@ class MacroJob:
         self.bait = bait
         self.bait_status = ""
         self.day = now_kst().date()
-        self.cycle_s = 3 * GAP_S + WAIT_S + 0.3
+        self.cycle_s = 2 * GAP_S + WAIT_S
         self._last_enter = 0.0
         self._last_command = None
         self._limit_seen = False     # 한도 직전 반복에서 '달성 보상'·'추가 낚시' 메시지를 봄
@@ -773,11 +785,16 @@ class MacroJob:
             release_stuck_keys()
 
     def _command(self, text):
-        """"@" → Enter → text → Enter. 정지했거나 창이 닫혔으면 False."""
+        """0.0s @, 0.5s Enter + text, 1.0s Enter; reply wait adds 3s."""
         self._last_command = text
-        if not self._send_text("@") or self._sleep(GAP_S, watch=True) or not self._press_enter("@"):
+        started = time.perf_counter()
+        if not self._send_text("@"):
             return False
-        if self._sleep(GAP_S, watch=True) or not self._send_text(text) or self._sleep(GAP_S, watch=True):
+        if self._sleep(max(0, started + GAP_S - time.perf_counter()), watch=True) or not self._press_enter("@"):
+            return False
+        if not self._send_text(text):
+            return False
+        if self._sleep(max(0, started + 2 * GAP_S - time.perf_counter()), watch=True):
             return False
         return self._press_enter(text)
 
@@ -788,11 +805,11 @@ class MacroJob:
         reply, fallback = None, None
         self.waiting = "reply"
         try:
-            if self._sleep(REPLY_FIRST_POLL_S, watch=True):
+            if self._sleep(max(0, self._last_enter + REPLY_FIRST_POLL_S - time.perf_counter()), watch=True):
                 return None
-            while not self._stop_event.is_set():
+            while not self._stop_event.is_set() and deadline - time.perf_counter() >= 0.5:
                 if GetForegroundWindow() == self.target:
-                    text = copy_chat(self.target)
+                    text = copy_chat(self.target, deadline=min(time.perf_counter() + 0.8, deadline - 0.2))
                     if text:
                         self.observer.observe(text)
                         replies = my_replies(text, self.user)
@@ -886,9 +903,10 @@ class MacroJob:
                 return False
             if attempt:
                 self.resent += 1
+            pressed_at = time.perf_counter()
             if not press_keys(VK_RETURN):
                 self.failures += 1
-            self._last_enter = time.perf_counter()
+            self._last_enter = pressed_at
             self._fresh_cycle = False
             if not typed:
                 return True

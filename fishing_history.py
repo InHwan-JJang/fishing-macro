@@ -78,7 +78,7 @@ def parse_details(text):
             data.setdefault("gold", reward)
     elif "진주 발견" in text or "pearls" in data:
         data["kind"] = "pearl"
-    elif "낚시 성공" in text or "대어 출현" in text or 'species' in data:
+    elif 'species' in data or ('today' in data and ('gold' in data or 'exp' in data)):
         data["kind"] = "fish"
     return data
 
@@ -305,6 +305,8 @@ class Observer:
         if sender != self.bot:
             return
         details = parse_details(body)
+        if not details.get("kind") and ("숨을 고른" in body or "아직" in body):
+            details["kind"] = "other"
         if body.startswith("@사용자") or body.startswith("@" + self.user):
             if self.pending:
                 owner, command, key = self.pending.popleft()
@@ -318,7 +320,9 @@ class Observer:
             card_kind = ("fish" if "species" in details else "pearl" if "pearls" in details
                          else "raid" if "damage" in details else "bag")
             candidates = [r for r in self.responses if not r["complete"] and
-                          (r["kind"] == card_kind or (card_kind == "bag" and r["command"] == "가방"))]
+                          (r["kind"] == card_kind or
+                           (r["kind"] is None and r["command"] == "낚시" and card_kind in ("fish", "pearl", "raid")) or
+                           (card_kind == "bag" and r["command"] == "가방"))]
             # Both players' responses remain pending until their own card arrives.
             # A pearl card can therefore never be appended to a fish response.
             self.active = candidates[0] if candidates else None
