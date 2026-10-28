@@ -34,7 +34,7 @@ from fishing_history import DailyHistory, History, Observer, now_kst, next_reset
 from history_window import HistoryWindow
 
 APP_TITLE = "낚시 매크로"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 ICON_FILE = "fishing.ico"
 ROOM_PREFIX = "낚시"            # 이 글자로 시작하는 카톡 채팅방을 찾음
 TEXT_FISH, TEXT_MANUAL = "낚시", "수동"
@@ -564,6 +564,9 @@ def classify_reply(body):
     | ("cooldown",) | ("other",)"""
     if "자동어" in body:
         return ("auto",)
+    extra = re.search(r'추가 낚시:\s*([\d,]+)\s*/\s*([\d,]+)', body)
+    if extra:
+        return ('extra_success', _num(extra[1]), _num(extra[2]))
     if EXTRA_MARK in body:
         return ("extra",)
     achieve = ACHIEVE_RE.search(body)
@@ -686,6 +689,7 @@ class MacroJob:
         self.target, self.user, self.repeat, self.auto = target, user, repeat, auto
         self.done = 0                # 이번 실행에서 끝낸 반복 수
         self.today = None            # 봇이 알려 준 오늘 낚시 횟수
+        self.phase = None            # 첫 유효 응답으로 daily / extra 결정
         self.limit = None            # 오늘 한도
         self.failures = self.resent = self.auto_releases = 0
         self.waiting = None
@@ -737,6 +741,7 @@ class MacroJob:
                 if now_kst().date() != self.day:
                     self.day = now_kst().date()
                     self.today = self.limit = None
+                    self.phase = None
                     self._limit_seen = False
                     self.observer.today = self.observer.limit = None
                 self._fresh_cycle = True
@@ -746,12 +751,17 @@ class MacroJob:
                 if reply is None:
                     return
                 kind = reply[0] if reply else "none"
+                if self.phase is None and kind in ('success', 'extra_success', 'extra', 'achieve'):
+                    self.phase = 'extra' if kind == 'extra_success' else 'daily'
                 if self.observer.today is not None and self.observer.limit is not None:
                     self.today, self.limit = self.observer.today, self.observer.limit
                 if kind == "success":
                     self.auto_releases = 0
                     if reply[1] is not None:
                         self.today, self.limit = reply[1], reply[2]
+                elif kind == 'extra_success' and self.phase == 'extra':
+                    self.today, self.limit = reply[1], reply[2]
+                    self._limit_seen = False
                 elif kind == "auto":
                     if not self._release_auto():
                         return
@@ -760,7 +770,7 @@ class MacroJob:
                 self.cycle_s = (time.perf_counter() - started) / cycles
                 if kind not in ("cooldown", "extra"):
                     self.done += 1
-                if limit_hit(reply, self.limit) or self._limit_seen or (self.today is not None and self.limit is not None and self.today >= self.limit):
+                if self._phase_limit_hit(reply):
                     # Give the final raid/reward card time to arrive before ending the job.
                     deadline = time.perf_counter() + 2.0
                     while time.perf_counter() < deadline:
@@ -772,7 +782,7 @@ class MacroJob:
                                 self.observer.observe(text)
                     self.limit = self.limit or DEFAULT_LIMIT
                     self.today = self.limit
-                    self.end_reason = "limit"
+                    self.end_reason = 'extra_limit' if self.phase == 'extra' else 'limit'
                     return
                 if not self.auto and self.done >= self.repeat:
                     self.end_reason = "finished"
@@ -814,7 +824,7 @@ class MacroJob:
                     if text:
                         self.observer.observe(text)
                         replies = my_replies(text, self.user)
-                        if self._near_limit() and limit_hit_after_my_command(text, self.user, self.limit):
+                        if getattr(self, 'phase', None) != 'extra' and self._near_limit() and limit_hit_after_my_command(text, self.user, self.limit):
                             self._limit_seen = True    # 3000번째는 답장이 둘(성공+달성)로 오기도 함
                         if replies and replies[-1][1] is not None and not self._stale(replies[-1][1]):
                             reply = replies[-1][1]
@@ -863,9 +873,15 @@ class MacroJob:
     def _near_limit(self):
         return self.today is not None and self.limit is not None and self.today >= self.limit - 1
 
+    def _phase_limit_hit(self, reply):
+        if self.phase == 'extra':
+            return self.today is not None and self.limit is not None and self.today >= self.limit
+        return (bool(reply and reply[0] == 'extra_success') or limit_hit(reply, self.limit) or
+                self._limit_seen or (self.today is not None and self.limit is not None and self.today >= self.limit))
+
     def _stale(self, reply):
         """'낚시 성공' 답장인데 오늘 횟수가 늘지 않았으면 남의 것이거나 이전 것."""
-        return reply and reply[0] == "success" and reply[1] is not None and self.today is not None \
+        return reply and (reply[0] == "success" or (reply[0] == 'extra_success' and getattr(self, 'phase', None) == 'extra')) and reply[1] is not None and self.today is not None \
             and reply[1] <= self.today
 
     def _release_auto(self):
@@ -1376,6 +1392,8 @@ class App:
             self._idle = (f"오늘 한도 도달 · {progress}", "")
             self._limit_completed = True
             self._update_shutdown_policy()
+        elif job.end_reason == 'extra_limit':
+            self._idle = (f"추가 낚시 한도 도달 · {progress}", "")
         elif job.end_reason == "target_closed":
             self._idle = (f"채팅방이 닫혀 정지 · {progress}", "")
         elif job.error:
@@ -1387,7 +1405,7 @@ class App:
     @staticmethod
     def _progress(job):
         if job.today is not None and job.limit is not None:
-            return f"오늘 {job.today:,} / {job.limit:,}"
+            return f"{'추가' if getattr(job, 'phase', None) == 'extra' else '오늘'} {job.today:,} / {job.limit:,}"
         return f"{job.done:,} / {job.repeat:,}" if not job.auto else f"{job.done:,}번"
 
     def _set_busy(self, busy):

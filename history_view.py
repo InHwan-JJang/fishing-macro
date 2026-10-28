@@ -25,6 +25,8 @@ def row_for(group, grouped=False):
     golds = [r['gold'] for r in group if 'gold' in r]
     exps = [r['exp'] for r in group if 'exp' in r]
     detail = []
+    if latest.get('phase') == 'extra':
+        detail.append('추가 낚시 · 재화·경험치 없음')
     if latest.get('boss_name'):
         detail.append(latest.get('raid_type', '레이드') + ': ' + latest['boss_name'])
     for key, title in (('pearls', '진주'), ('damage', '데미지'), ('stones', '해신석'), ('bonus', '달성 보상 G')):
@@ -51,7 +53,7 @@ def row_for(group, grouped=False):
     elif latest.get('card_attribute'):
         detail.append(latest['card_attribute'])
     return dict(time=latest['time'][:19].replace('T', ' '), band=sale_percent(latest),
-                today=latest.get('today'), limit=latest.get('limit'),
+                today=latest.get('today'), limit=latest.get('limit'), phase=latest.get('phase'),
                 species=latest.get('species', latest.get('boss_name', {'auto':'자동어', 'pearl':'진주', 'raid':'레이드'}.get(latest['kind'], '어종 미확인'))),
                 grade=latest.get('grade', ''), count=latest.get('_cumulative', len(group)), size=latest.get('size'),
                 gold=sum(golds) if golds else None,
@@ -111,7 +113,7 @@ def display_row(row):
     for column in COLUMNS:
         value = row[column]
         if column == 'today':
-            values.append(f"{value:,} / {row['limit']:,}" if value is not None and row.get('limit') is not None else '—')
+            values.append(('추가 ' if row.get('phase') == 'extra' else '') + f"{value:,} / {row['limit']:,}" if value is not None and row.get('limit') is not None else '—')
         elif value is None or value == '':
             values.append('—')
         elif column == 'band':

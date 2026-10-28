@@ -29,6 +29,10 @@ def number(text, pattern):
 
 def parse_details(text):
     data = {}
+    extra = re.search(r'추가 낚시:\s*([\d,]+)\s*/\s*([\d,]+)', text)
+    if extra:
+        data.update(phase='extra', today=int(extra[1].replace(',', '')), limit=int(extra[2].replace(',', '')),
+                    multiplier=0, gold=0, exp=0, kind='fish')
     patterns = {
         "gold": r"획득 골드:\s*([\d,]+)G",
         "balance": r"보유 골드:\s*([\d,]+)G",
@@ -56,7 +60,7 @@ def parse_details(text):
         # A catch card need not have a physical length (e.g. equipment '9강').
         # Still consume its response slot so the next fish cannot inherit it.
         card = re.search(r"^\[([^\]\n]+)\]([^\n]*)", text, re.MULTILINE)
-        if card:
+        if card and card[1].strip() not in GRADES:
             data['species'] = card[1].strip()
             attribute = card[2].strip()
             if attribute:
@@ -96,6 +100,8 @@ def parse_details(text):
 
 
 def segment(record):
+    if record.get('phase') == 'extra':
+        return '추가 낚시 · 0%'
     count = record.get("today")
     if count is None:
         return "횟수 미확인"
@@ -209,7 +215,7 @@ class DailyHistory(History):
                     unique = {}
                     for row in rows:
                         # Same user's same daily catch across copied session exports.
-                        identity = ((row.get('user'), row['kind'], row['today'])
+                        identity = ((row.get('user'), row['kind'], row.get('phase', 'daily'), row['today'])
                                     if row.get('today') is not None and row['kind'] in ('fish', 'pearl', 'raid')
                                     else tuple(sorted((k, str(v)) for k, v in row.items() if k != 'id')))
                         unique.setdefault(identity, {}).update(row)
@@ -404,7 +410,7 @@ def annotate_luck(records):
     for record in sorted(records, key=lambda r: (r['time'], r['id'])):
         count = record.get('today')
         for effect, _ in EFFECTS:
-            key = (record.get('user'), record['time'][:10], effect)
+            key = (record.get('user'), record['time'][:10], record.get('phase', 'daily'), effect)
             remaining = record.get(f'{effect}_remaining')
             anchor = anchors.get(key)
             applied = granted = False
