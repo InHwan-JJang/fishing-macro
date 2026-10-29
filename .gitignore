@@ -17,3 +17,6 @@ settings.json
 /history/
 
 /fishing-macro-history/
+
+# Diagnostic logs
+/debug/

@@ -1,4 +1,5 @@
 """Session history and game text parsing. No desktop input or clipboard access."""
+from debug_logging import LOG, traced
 from collections import deque
 from datetime import datetime, timedelta, timezone
 import re
@@ -87,7 +88,18 @@ def parse_details(text):
             data.update(hp_percent=float(hp[1]), hp_current=int(hp[2].replace(',', '')), hp_max=int(hp[3].replace(',', '')))
     elif echo_boss:
         data.update(raid_type='잔향', boss_name=echo_boss[1].strip())
-    if "자동어" in text:
+    if re.search(r"운영자(?:가 찾아왔|\s*출현)", text):
+        data['kind'] = 'operator'
+        for key, pattern in {
+            'gold': r'([\d,]+)\s*G\b',
+            'pearls': r'진주\s*\+?\s*([\d,]+)\s*개',
+            'bait': r'미끼\s*\+?\s*([\d,]+)\s*개',
+            'stones': r'해신석\s*\+?\s*([\d,]+)\s*개',
+        }.items():
+            reward = number(text, pattern)
+            if reward is not None:
+                data[key] = reward
+    elif "자동어" in text:
         data["kind"] = "auto"
     elif world_boss or echo_boss or "잔향 피해" in text or "레이드" in text or "잔향을 마주쳤" in text:
         data["kind"] = "raid"
@@ -141,6 +153,7 @@ class History:
         self.recovery_attempted = set()
         self.recovery_status = ''
 
+    @traced
     def request_recovery(self):
         with self._lock:
             self.recovery_pending = True
@@ -159,6 +172,7 @@ class History:
             merged.setdefault("time", (stamp or now_kst()).isoformat(timespec="seconds"))
             merged.setdefault("id", key)
             if merged != old:
+                LOG.debug("HISTORY update key=%s data=%r", key, merged)
                 self.records[key] = merged
                 self.version += 1
                 self.save()
@@ -174,6 +188,7 @@ class History:
                 self.save_error = None
                 return True
             except OSError as error:
+                LOG.exception("HISTORY save failed path=%s", self.path)
                 self.save_error = str(error)
                 return False
 
@@ -210,6 +225,7 @@ class DailyHistory(History):
         with self._lock:
             if day == self.day:
                 return
+            LOG.info("HISTORY day change previous=%s next=%s", self.day, day)
             path = self.directory / f'{day}.csv'
             if day not in self.loaded_days:
                 if path.exists():
@@ -272,6 +288,7 @@ class DailyHistory(History):
                 self.saved_version = self.version
                 return True
             except OSError as error:
+                LOG.exception("HISTORY save failed path=%s", self.path)
                 self.save_error = str(error)
                 return False
 
@@ -294,6 +311,7 @@ class Observer:
         self.awaiting_baseline = False
 
     def baseline(self, text):
+        LOG.debug("OBSERVER baseline chars=%s user=%r", len(text), self.user)
         self.previous = messages(text)
 
     def observe(self, text):
@@ -327,6 +345,7 @@ class Observer:
                     overlap = size
                     break
             if old and not overlap:
+                LOG.warning("OBSERVER lost overlap; rebaseline old=%s current=%s", len(old), len(current))
                 return  # Rebaseline instead of counting old history again.
             fresh = current[overlap:]
         for sender, body in fresh:
@@ -335,11 +354,13 @@ class Observer:
     def _consume(self, sender, body):
         command = COMMAND.match(body)
         if command:
+            LOG.debug("CHAT command sender=%r body=%r", sender, body)
             self.bot = command[1]
             self.pending.append((sender, command[2], self.history.new_id()))
             return
         if sender != self.bot:
             return
+        LOG.debug("CHAT bot=%r body=%r", sender, body)
         details = parse_details(body)
         if not details.get("kind") and ("숨을 고른" in body or "아직" in body):
             details["kind"] = "other"
@@ -352,12 +373,12 @@ class Observer:
                 # A result without a corresponding command must not overwrite
                 # the preceding player's catch (e.g. a missed command).
                 self.active = None
-        elif details.get("species") or "pearls" in details or "damage" in details or "boss_name" in details or "미끼:" in body:
-            card_kind = ("fish" if "species" in details else "pearl" if "pearls" in details
+        elif details.get('kind') == 'operator' or details.get("species") or "pearls" in details or "damage" in details or "boss_name" in details or "미끼:" in body:
+            card_kind = ('operator' if details.get('kind') == 'operator' else "fish" if "species" in details else "pearl" if "pearls" in details
                          else "raid" if "damage" in details or "boss_name" in details else "bag")
             candidates = [r for r in self.responses if not r["complete"] and
                           (r["kind"] == card_kind or
-                           (r["kind"] is None and r["command"] == "낚시" and card_kind in ("fish", "pearl", "raid")) or
+                           (r["kind"] is None and r["command"] == "낚시" and card_kind in ("fish", "pearl", "raid", "operator")) or
                            (card_kind == "bag" and r["command"] == "가방"))]
             # Both players' responses remain pending until their own card arrives.
             # A pearl card can therefore never be appended to a fish response.
@@ -370,7 +391,7 @@ class Observer:
         data = parse_details(context["text"])
         if data.get("kind"):
             context["kind"] = data["kind"]
-        if "species" in data or "pearls" in data or "damage" in data:
+        if "species" in data or "pearls" in data or "damage" in data or (data.get('kind') == 'operator' and 'gold' in data):
             context["complete"] = True
         if owner != self.user and not getattr(self, 'capture_all', False):
             return

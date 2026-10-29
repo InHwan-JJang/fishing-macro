@@ -1,5 +1,6 @@
 """Atomic session CSV persistence and validated history loading."""
 import csv
+from debug_logging import LOG, traced
 import json
 import math
 import os
@@ -12,15 +13,16 @@ FIELDS = ('id', 'time', 'user', 'kind', 'species', 'grade', 'size', 'today', 'li
           'frost_remaining', 'fire_remaining', 'frost_active', 'fire_active',
           'frost_granted', 'fire_granted', 'any_lucky',
           'boss_name', 'raid_type', 'hp_current', 'hp_max', 'hp_percent', 'phase',
-          'recovered', 'individual_session')
+          'recovered', 'individual_session', 'bait')
 INTEGERS = {'id', 'today', 'limit', 'gold', 'multiplier', 'balance', 'exp', 'pearls',
-            'damage', 'stones', 'bonus', 'luck_remaining', 'enhancement', 'frost_remaining', 'fire_remaining', 'hp_current', 'hp_max'}
+            'damage', 'stones', 'bonus', 'bait', 'luck_remaining', 'enhancement', 'frost_remaining', 'fire_remaining', 'hp_current', 'hp_max'}
 BOOLEANS = {'collection', 'lucky', 'luck_granted', 'frost_active', 'fire_active', 'frost_granted', 'fire_granted', 'any_lucky'}
 BOOLEANS.update(('recovered', 'individual_session'))
 
 
 def save_csv(path, records):
     path = Path(path)
+    LOG.debug("STORAGE path=%s", path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix('.csv.tmp')
     try:
@@ -31,13 +33,19 @@ def save_csv(path, records):
             file.flush()
             os.fsync(file.fileno())
         os.replace(temporary, path)
+        LOG.debug("STORAGE saved path=%s", path)
+    except Exception:
+        LOG.exception("STORAGE save failed path=%s", path)
+        raise
     finally:
         if temporary.exists():
             temporary.unlink()
 
 
+@traced
 def load_records(path):
     path = Path(path)
+    LOG.debug("STORAGE path=%s", path)
     with path.open(encoding='utf-8-sig', newline='') as file:
         if path.suffix.lower() == '.json':
             source = json.load(file)
@@ -74,7 +82,7 @@ def load_records(path):
                     raise ValueError(f'{key} 문자열 오류')
                 data[key] = value
             datetime.fromisoformat(data['time'])
-            if data['kind'] not in ('fish', 'pearl', 'auto', 'raid'):
+            if data['kind'] not in ('fish', 'pearl', 'auto', 'raid', 'operator'):
                 raise ValueError('기록 종류 오류')
             data.setdefault('id', index)
             if data['id'] in ids:
@@ -86,6 +94,7 @@ def load_records(path):
     return records
 
 
+@traced
 def delete_past_files(paths, directory, active_path):
     """Caller confirms exact selections; validate every path before deleting any."""
     root = Path(directory).resolve()
@@ -96,3 +105,4 @@ def delete_past_files(paths, directory, active_path):
             raise ValueError(f'삭제할 수 없는 파일: {path.name}')
     for path in selected:
         path.unlink()
+        LOG.info("STORAGE deleted path=%s", path)

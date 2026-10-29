@@ -1,4 +1,5 @@
 """Conservative, one-shot recovery from dated copied chat, never desktop input."""
+from debug_logging import LOG
 from datetime import datetime
 import re
 
@@ -96,6 +97,7 @@ def recover_missing(history, text, user, bot):
                    any((day, user, n) not in history.recovery_attempted for n in range(lo, hi + 1))]
         if not requested and not targets:
             return
+        LOG.info("RECOVERY begin user=%r requested=%s targets=%s", user, requested, targets)
         history.recovery_pending = False
         for lo, hi in targets:
             history.recovery_attempted.update((day, user, n) for n in range(lo, hi + 1))
@@ -138,4 +140,5 @@ def recover_missing(history, text, user, bot):
         remaining = sum(hi - lo + 1 for lo, hi in missing_runs(history.snapshot(), user, day))
         if remaining:
             history.recovery_status += f' · {remaining}건 미복구 (오늘 날짜·카운트·소유자/골드 근거 부족)'
+        LOG.info("RECOVERY end status=%s", history.recovery_status)
         history.version += 1

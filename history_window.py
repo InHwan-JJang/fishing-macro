@@ -1,4 +1,5 @@
 """Read-only session history viewer."""
+from debug_logging import traced
 import tkinter as tk
 from tkinter import ttk, font as tkfont
 from fishing_history import GRADES, COLORS
@@ -92,10 +93,12 @@ class HistoryWindow:
             for label in (self.summary, self.detail, self.warning):
                 label.configure(wraplength=max(100, event.width - 32))
 
+    @traced
     def request_recovery(self):
         self.current_history.request_recovery()
         self.refresh()
 
+    @traced
     def change_tab(self, event=None):
         self.mode.set(MODES[self.tabs.index(self.tabs.select())])
         self.refresh()
@@ -108,18 +111,22 @@ class HistoryWindow:
             return
         self.window.after_idle(self.change_tab)
 
+    @traced
     def show_statistics(self):
         self.tabs.select(MODES.index('구간'))
         self.change_tab()
 
+    @traced
     def close(self):
         if self.timer:
             self.window.after_cancel(self.timer)
         self.window.destroy()
 
+    @traced
     def show_current(self):
         self.set_history(self.current_history)
 
+    @traced
     def set_history(self, history, path=None):
         self.history, self.source_path = history, path
         self.window.title("낚시 히스토리 · " + (str(path) if path else "오늘 기록"))
@@ -145,6 +152,7 @@ class HistoryWindow:
             self.refresh()
         self.timer = self.window.after(1000, self.poll)
 
+    @traced
     def toggle_sort(self, column):
         if self.sort_column != column:
             self.sort_column, self.sort_direction = column, 1
@@ -183,12 +191,15 @@ class HistoryWindow:
             records = [r for r in records if r.get('grade') == grade]
         fish = [r for r in records if r["kind"] == "fish"]
         raids = [r for r in records if r["kind"] == "raid"]
+        operators = [r for r in records if r['kind'] == 'operator']
         sum_key = lambda rows, key: sum(r.get(key, 0) for r in rows)
         self.revenue.configure(text=f"총 판매수익 {sum_key(fish, 'gold'):,}G")
         self.summary.configure(text=(f"물고기 {len(fish):,}마리 · "
             f"획득 경험치 {sum_key(records, 'exp'):,} EXP · 진주 +{sum_key(records, 'pearls'):,}개 · "
             f"자동어 {sum(r['kind'] == 'auto' for r in records)}회 · "
-            f"레이드 {sum_key(raids, 'gold'):,}G / 해신석 {sum_key(raids, 'stones'):,}개 · 달성 보상 {sum_key(records, 'bonus'):,}G"))
+            f"레이드 {sum_key(raids, 'gold'):,}G / 해신석 {sum_key(raids, 'stones'):,}개 · 달성 보상 {sum_key(records, 'bonus'):,}G\n"
+            f"운영자 출현 {len(operators):,}회 · 보상 {sum_key(operators, 'gold'):,}G / "
+            f"진주 {sum_key(operators, 'pearls'):,}개 / 미끼 {sum_key(operators, 'bait'):,}개 / 해신석 {sum_key(operators, 'stones'):,}개"))
         totals = " / ".join(f"{g} {sum(r.get('grade') == g for r in fish):,}마리" for g in (GRADES if grade == "전체" else (grade,)))
         unknown_exp = sum('exp' not in r for r in fish)
         unknown_fish = sum('species' not in r for r in fish)

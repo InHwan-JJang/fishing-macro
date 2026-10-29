@@ -35,7 +35,7 @@ def row_for(group, grouped=False):
         detail.append('개별 세션')
     if latest.get('boss_name'):
         detail.append(latest.get('raid_type', '레이드') + ': ' + latest['boss_name'])
-    for key, title in (('pearls', '진주'), ('damage', '데미지'), ('stones', '해신석'), ('bonus', '달성 보상 G')):
+    for key, title in (('pearls', '진주'), ('bait', '미끼'), ('damage', '데미지'), ('stones', '해신석'), ('bonus', '달성 보상 G')):
         if any(key in r for r in group):
             detail.append(f"{title} {sum(r.get(key, 0) for r in group):,}")
     if any(r.get('collection') for r in group):
@@ -60,7 +60,7 @@ def row_for(group, grouped=False):
         detail.append(latest['card_attribute'])
     return dict(time=latest['time'][:19].replace('T', ' '), band=sale_percent(latest),
                 today=latest.get('today'), limit=latest.get('limit'), phase=latest.get('phase'),
-                species=latest.get('species', latest.get('boss_name', {'auto':'자동어', 'pearl':'진주', 'raid':'레이드'}.get(latest['kind'], '어종 미확인'))),
+                species=latest.get('species', latest.get('boss_name', {'auto':'자동어', 'pearl':'진주', 'raid':'레이드', 'operator':'운영자 출현'}.get(latest['kind'], '어종 미확인'))),
                 grade=latest.get('grade', ''), count=latest.get('_cumulative', len(group)), size=latest.get('size'),
                 gold=sum(golds) if golds else None,
                 exp=sum(exps) if exps else None, extra=' · '.join(detail) or '—')

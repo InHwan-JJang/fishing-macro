@@ -15,7 +15,7 @@
 import ctypes
 import json
 import logging
-from logging.handlers import RotatingFileHandler
+from debug_logging import LOG, setup_logging, traced
 import os
 import queue
 import re
@@ -34,7 +34,7 @@ from fishing_history import DailyHistory, History, Observer, now_kst, next_reset
 from history_window import HistoryWindow
 
 APP_TITLE = "낚시 매크로"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.3.1"
 ICON_FILE = "fishing.ico"
 ROOM_PREFIX = "낚시"            # 이 글자로 시작하는 카톡 채팅방을 찾음
 TEXT_FISH, TEXT_MANUAL = "낚시", "수동"
@@ -58,7 +58,6 @@ UI_FONT = "Malgun Gothic"
 SETTINGS_FILE = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "FishingMacro", "settings.json")
 CLIPBOARD_PRIVATE_FORMATS = ("ExcludeClipboardContentFromMonitorProcessing", "CanIncludeInClipboardHistory",
                              "CanUploadToCloudClipboard")
-LOG = logging.getLogger("FishingMacro")
 WAIT_MESSAGES = {
     "window": "채팅방을 다시 클릭하면 계속합니다",
     "keys": "Shift·Ctrl·Alt를 떼면 계속합니다",
@@ -67,7 +66,6 @@ WAIT_MESSAGES = {
     "unsent": "메시지가 안 보내짐 · 입력창을 정리하면 계속",
     "reply": "봇 답장을 기다리는 중",
     "auto": "자동어 해제 중",
-    "stuck_auto": "자동어가 안 풀림 · 직접 확인해 주세요",
 }
 
 # ── Win32 ────────────────────────────────────────────────────────────────
@@ -564,6 +562,8 @@ def classify_reply(body):
     | ("cooldown",) | ("other",)"""
     if "자동어" in body:
         return ("auto",)
+    if parse_details(body).get('kind') == 'operator':
+        return ('operator',)
     extra = re.search(r'추가 낚시:\s*([\d,]+)\s*/\s*([\d,]+)', body)
     if extra:
         return ('extra_success', _num(extra[1]), _num(extra[2]))
@@ -665,18 +665,22 @@ class GlobalHotkeys(threading.Thread):
         registered = []
         for hotkey_id, vk in self._keys.items():
             if RegisterHotKey(None, hotkey_id, MOD_NOREPEAT, vk):
+                LOG.info("HOTKEY registered id=%s vk=%s", hotkey_id, vk)
                 registered.append(hotkey_id)
             else:
+                LOG.warning("HOTKEY registration failed id=%s error=%s", hotkey_id, ctypes.get_last_error())
                 self.failed.append(hotkey_id)
         self.ready.set()
         try:
             while GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
                 if msg.message == WM_HOTKEY:
+                    LOG.info("HOTKEY received id=%s", msg.wParam)
                     self._events.put(msg.wParam)
         finally:
             for hotkey_id in registered:
                 UnregisterHotKey(None, hotkey_id)
 
+    @traced
     def stop(self):
         if self._thread_id:
             PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
@@ -707,6 +711,7 @@ class MacroJob:
         self._clears_after_send = False
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
+        LOG.info("JOB START target=%s user=%r repeat=%s auto=%s bait=%s", target, user, repeat, auto, bait)
         self._thread.start()
 
     @property
@@ -719,6 +724,7 @@ class MacroJob:
             return max(0, self.limit - self.today) if self.limit is not None and self.today is not None else None
         return max(0, self.repeat - self.done)
 
+    @traced
     def stop(self, wait=0.0):
         self._stop_event.set()
         self._thread.join(wait)
@@ -737,6 +743,7 @@ class MacroJob:
                 self.observer.baseline(initial)
             started = time.perf_counter()
             cycles = 0
+            next_command = TEXT_FISH
             while True:
                 if now_kst().date() != self.day:
                     self.day = now_kst().date()
@@ -745,11 +752,19 @@ class MacroJob:
                     self._limit_seen = False
                     self.observer.today = self.observer.limit = None
                 self._fresh_cycle = True
-                if not self._command(TEXT_FISH):
+                command = next_command
+                LOG.info("CYCLE command=%s done=%s today=%s limit=%s phase=%s releases=%s", command, self.done, self.today, self.limit, self.phase, self.auto_releases)
+                if not self._command(command):
                     return
                 reply = self._await_reply()      # 답장을 읽으면서 마지막 Enter부터 WAIT_S초를 기다림
+                LOG.info("CYCLE reply=%r command=%s", reply, command)
                 if reply is None:
                     return
+                if command == TEXT_MANUAL:
+                    self.auto_releases += 1
+                    LOG.info("AUTO release sent attempt=%s; next fishing verifies result", self.auto_releases)
+                    next_command = TEXT_FISH
+                    continue  # 해제 여부는 다음 낚시 결과로 판단합니다.
                 kind = reply[0] if reply else "none"
                 if self.phase is None and kind in ('success', 'extra_success', 'extra', 'achieve'):
                     self.phase = 'extra' if kind == 'extra_success' else 'daily'
@@ -760,11 +775,16 @@ class MacroJob:
                     if reply[1] is not None:
                         self.today, self.limit = reply[1], reply[2]
                 elif kind == 'extra_success' and self.phase == 'extra':
+                    self.auto_releases = 0
                     self.today, self.limit = reply[1], reply[2]
                     self._limit_seen = False
                 elif kind == "auto":
-                    if not self._release_auto():
+                    if self.auto_releases >= MAX_AUTO_RELEASE:
+                        LOG.error("AUTO still present after %s releases; stopping", self.auto_releases)
+                        self.end_reason = "stuck_auto"
                         return
+                    LOG.warning("AUTO detected; scheduling manual command attempt=%s", self.auto_releases + 1)
+                    next_command = TEXT_MANUAL
                     continue                        # 자동어 낚시는 횟수에 안 들어감 → 다시
                 cycles += 1
                 self.cycle_s = (time.perf_counter() - started) / cycles
@@ -791,12 +811,15 @@ class MacroJob:
                     if not self._use_bait(self.observer.buff_requests.popleft()):
                         return
         except Exception:
+            LOG.exception("JOB exception")
             self.error = traceback.format_exc()
         finally:
+            LOG.info("JOB END reason=%s stopped=%s done=%s today=%s limit=%s failures=%s resent=%s releases=%s", self.end_reason, self._stop_event.is_set(), self.done, self.today, self.limit, self.failures, self.resent, self.auto_releases)
             release_stuck_keys()
 
     def _command(self, text):
         """0.0s @, 0.5s Enter + text, 1.0s Enter; reply wait adds 3s."""
+        LOG.info("COMMAND begin text=%r foreground=%s target=%s", text, GetForegroundWindow(), self.target)
         self._last_command = text
         started = time.perf_counter()
         if not self._send_text("@"):
@@ -807,7 +830,9 @@ class MacroJob:
             return False
         if self._sleep(max(0, started + 2 * GAP_S - time.perf_counter()), watch=True):
             return False
-        return self._press_enter(text)
+        sent = self._press_enter(text)
+        LOG.info("COMMAND end text=%r sent=%s", text, sent)
+        return sent
 
     def _await_reply(self):
         """마지막 Enter부터 WAIT_S초 동안 기다리면서 내 명령에 대한 봇 답장을 읽습니다.
@@ -836,12 +861,14 @@ class MacroJob:
                     return None
         finally:
             self.waiting = None
+        LOG.debug("REPLY selected=%r fallback=%r", reply, fallback)
         if reply is None:        # 짝짓기가 어긋났으면 내 명령 뒤에 온 마지막 답장을 씀
             reply = () if fallback is None or self._stale(fallback) else fallback
         if self._sleep(max(0.0, deadline - time.perf_counter()), watch=True):
             return None
         return reply
 
+    @traced
     def _use_bait(self, maximum):
         self.observer.bag_count = None
         version = self.observer.bag_version
@@ -884,24 +911,8 @@ class MacroJob:
         return reply and (reply[0] == "success" or (reply[0] == 'extra_success' and getattr(self, 'phase', None) == 'extra')) and reply[1] is not None and self.today is not None \
             and reply[1] <= self.today
 
-    def _release_auto(self):
-        """"@" → Enter → "수동" → Enter 로 자동어를 풉니다. 여러 번 해도 안 풀리면 사용자에게 맡기고 기다립니다."""
-        self.auto_releases += 1
-        if self.auto_releases > MAX_AUTO_RELEASE:
-            self.waiting = "stuck_auto"
-            while not self._stop_event.is_set():           # 사용자가 직접 풀고 창을 다시 클릭하면 계속
-                if self._sleep(1.0):
-                    return False
-                if GetForegroundWindow() == self.target and self.waiting != "stuck_auto":
-                    break
-            self.auto_releases = 0
-            return not self._stop_event.is_set()
-        self.waiting = "auto"
-        if self._sleep(GAP_S, watch=True) or not self._command(TEXT_MANUAL):
-            return False
-        return self._await_reply() is not None
-
     def _send_text(self, text):
+        LOG.debug("INPUT text=%r", text)
         for i, piece in enumerate(text):
             if i and self._sleep(CHAR_GAP_S):
                 return False
@@ -909,6 +920,7 @@ class MacroJob:
                 return False
             self._fresh_cycle = False
             if not type_unicode(piece):
+                LOG.warning("INPUT Unicode failed piece=%r error=%s", piece, ctypes.get_last_error())
                 self.failures += 1
         return True
 
@@ -921,17 +933,21 @@ class MacroJob:
             if attempt:
                 self.resent += 1
             pressed_at = time.perf_counter()
+            LOG.debug("INPUT Enter typed=%r attempt=%s", typed, attempt + 1)
             if not press_keys(VK_RETURN):
+                LOG.warning("INPUT Enter failed error=%s", ctypes.get_last_error())
                 self.failures += 1
             self._last_enter = pressed_at
             self._fresh_cycle = False
             if not typed:
                 return True
             sent = self._wait_box(self._sent_check(typed), SEND_CHECK_TIMEOUT_S)
+            LOG.debug("INPUT send check typed=%r result=%s", typed, sent)
             if self._stop_event.is_set():
                 return False
             if sent is not False:
                 return True
+        LOG.warning("INPUT retries exhausted typed=%r; waiting for input box cleanup", typed)
         self.waiting = "unsent"
         while not self._stop_event.is_set():
             if GetForegroundWindow() == self.target:
@@ -951,14 +967,18 @@ class MacroJob:
 
     def _wait_box(self, predicate, timeout):
         deadline = time.perf_counter() + timeout
+        text = None
         while True:
             if GetForegroundWindow() == self.target:
                 text = focused_text(self.target)
                 if text is None:
+                    LOG.debug("INPUT box unavailable")
                     return None
                 if predicate(text):
+                    LOG.debug("INPUT box matched text=%r", text[:300])
                     return True
             if time.perf_counter() >= deadline:
+                LOG.warning("INPUT box timeout seconds=%s text=%r", timeout, text[:300] if text else text)
                 return False
             if self._sleep(0.03):
                 return None
@@ -966,6 +986,9 @@ class MacroJob:
     def _wait_until_ready(self):
         while not self._stop_event.is_set():
             reason = self._blocker()
+            if reason != getattr(self, "_logged_blocker", None):
+                LOG.info("INPUT readiness reason=%s foreground=%s target=%s", reason, GetForegroundWindow(), self.target)
+                self._logged_blocker = reason
             if reason is None:
                 if self.waiting is None:
                     return True
@@ -1004,6 +1027,7 @@ class MacroJob:
 
 
 # ── 설정 저장 ────────────────────────────────────────────────────────────
+@traced
 def load_settings():
     try:
         with open(SETTINGS_FILE, encoding="utf-8") as f:
@@ -1013,13 +1037,15 @@ def load_settings():
         return {}
 
 
+@traced
 def save_settings(data):
+    LOG.debug("SETTINGS save values=%r", data)
     try:
         os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
     except OSError:
-        pass
+        LOG.exception("Settings save failed path=%s", SETTINGS_FILE)
 
 
 # ── 화면 ─────────────────────────────────────────────────────────────────
@@ -1172,6 +1198,7 @@ class App:
         self.version_label.grid(row=11, column=0, columnspan=3, sticky="e", pady=(0, 1))
         self._arm_schedule()
 
+    @traced
     def show_history(self):
         if self.history_view and self.history_view.window.winfo_exists():
             self.history_view.window.lift()
@@ -1179,18 +1206,21 @@ class App:
             self.history_view = HistoryWindow(self.root, self.history, self.load_history, self.delete_history,
                                               lambda: self.job is not None or self._dialog_open)
 
+    @traced
     def _arm_schedule(self):
         self._scheduled_at = next_reset(now_kst()) if self.schedule_var.get() else None
         if not self.schedule_var.get():
             self._schedule_pending = False
         self._update_shutdown_policy()
 
+    @traced
     def cancel_shutdown(self):
         self.shutdown_var.set(False)
         self._shutdown_deferred = False
         self._shutdown_at = None
         self._notice("PC 자동 종료를 취소했습니다")
 
+    @traced
     def _update_shutdown_policy(self):
         if not self.shutdown_var.get():
             self._shutdown_at = None
@@ -1211,6 +1241,7 @@ class App:
             self._schedule_pending = False
         if self._shutdown_at is None:
             self._shutdown_at = time.monotonic() + 60
+            LOG.info("SHUTDOWN countdown started seconds=60")
 
     def _persist_history(self):
         if self.history.save():
@@ -1218,6 +1249,7 @@ class App:
         self._notice("히스토리 자동 저장 실패 · 폴더 권한과 디스크 공간을 확인하세요", 10)
         return False
 
+    @traced
     def load_history(self):
         if self.job or self._dialog_open:
             return
@@ -1230,10 +1262,12 @@ class App:
                 loaded = History.load(path)
                 self.history_view.set_history(loaded, path)
         except (OSError, ValueError, UnicodeError) as error:
+            LOG.exception("History load failed")
             messagebox.showerror("불러오기 실패", str(error), parent=self.history_view.window)
         finally:
             self._dialog_open = False
 
+    @traced
     def delete_history(self):
         if self.job or self._dialog_open:
             return
@@ -1253,6 +1287,7 @@ class App:
             if source and Path(source).resolve() in [Path(p).resolve() for p in paths]:
                 self.history_view.show_current()
         except (OSError, ValueError) as error:
+            LOG.exception("History delete failed")
             messagebox.showerror("삭제 실패", str(error), parent=self.history_view.window)
         finally:
             self._dialog_open = False
@@ -1262,6 +1297,7 @@ class App:
             self.history.ensure_day()
         now = now_kst()
         if self._scheduled_at and now >= self._scheduled_at:
+            LOG.info("SCHEDULE triggered at=%s", self._scheduled_at)
             self._scheduled_at = next_reset(now)
             self._schedule_pending = True
             self._shutdown_at = None
@@ -1282,9 +1318,11 @@ class App:
                     try:
                         result = subprocess.run([os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "shutdown.exe"), "/s", "/t", "0"],
                                                 creationflags=subprocess.CREATE_NO_WINDOW, capture_output=True)
+                        LOG.info("SHUTDOWN request returncode=%s stderr=%r", result.returncode, result.stderr)
                         if result.returncode:
                             self._notice("PC 종료 요청 실패", 10)
                     except OSError as error:
+                        LOG.exception("SHUTDOWN request failed")
                         self._error_dialog(str(error))
         else:
             text = f"다음 예약: {self._scheduled_at:%m/%d %H:%M:%S}" if self._scheduled_at else "자정 예약 꺼짐"
@@ -1292,9 +1330,11 @@ class App:
                 text += " · 예약 낚시 완료 후 PC 종료"
             self.schedule_label.configure(text=text)
 
+    @traced
     def _apply_auto(self):
         self.repeat_box.configure(state="disabled" if self.auto_var.get() or self.job else "normal")
 
+    @traced
     def _apply_topmost(self):
         self.root.attributes("-topmost", self.topmost_var.get())
 
@@ -1310,12 +1350,15 @@ class App:
             raise ValueError(f"횟수는 {REPEAT_RANGE[0]} ~ {REPEAT_RANGE[1]:,} 사이로 입력하세요.")
         return dict(user=user, repeat=repeat, auto=self.auto_var.get())
 
+    @traced
     def _save_options(self):
         save_settings(dict(self._settings(), topmost=self.topmost_var.get(),
                            schedule=self.schedule_var.get(), bait=self.bait_var.get()))
 
     # ── 동작 ─────────────────────────────────────────────────────────────
+    @traced
     def start(self, scheduled=False):
+        LOG.info("START requested scheduled=%s", scheduled)
         if self.job or self._dialog_open:
             return
         try:
@@ -1328,6 +1371,7 @@ class App:
             settings["auto"] = True
         room = find_fishing_room()
         if room is None:
+            LOG.warning("START no fishing room found")
             self._idle = ("채팅방 없음", f"'{ROOM_PREFIX}'로 시작하는 카톡 채팅방을 열어 주세요")
             return
         if is_elevated(window_pid(room)) and not is_elevated():
@@ -1335,6 +1379,7 @@ class App:
                        "이 매크로도 관리자 권한으로 실행하세요.")
             return
         if not bring_to_front(room):
+            LOG.warning("START unable to foreground room=%s", room)
             self._idle = ("시작 실패", "채팅방 창을 앞으로 가져오지 못했습니다. 한 번 클릭해 주세요")
             return
         self._shutdown_at = None
@@ -1346,6 +1391,7 @@ class App:
         self.job = MacroJob(room, **settings, history=self.history, bait=self.bait_var.get())
         self._set_busy(True)
 
+    @traced
     def stop(self):
         self._shutdown_at = None
         self._schedule_pending = False
@@ -1359,9 +1405,11 @@ class App:
         self._idle = (f"정지됨 · {self._progress(job)}", "")
         self._set_busy(False)
 
+    @traced
     def toggle(self):
         self.stop() if self.job else self.start()
 
+    @traced
     def close(self):
         self._shutdown_at = None
         self._scheduled_at = None
@@ -1382,6 +1430,7 @@ class App:
             self.root.after_cancel(self._poll_id)
         self.root.destroy()
 
+    @traced
     def _finish_job(self):
         job, self.job = self.job, None
         self._set_busy(False)
@@ -1396,6 +1445,9 @@ class App:
             self._idle = (f"추가 낚시 한도 도달 · {progress}", "")
         elif job.end_reason == "target_closed":
             self._idle = (f"채팅방이 닫혀 정지 · {progress}", "")
+        elif job.end_reason == "stuck_auto":
+            self._idle = (f"자동어 해제 실패로 정지 · {progress}",
+                          "3회 해제 후에도 자동어가 나타났습니다 · 직접 확인해 주세요")
         elif job.error:
             self._idle = (f"오류로 정지 · {progress}", "")
             self._error_dialog("입력 도중 오류가 발생해 정지했습니다.\n\n" + job.error[-1500:])
@@ -1416,6 +1468,7 @@ class App:
         self.stop_btn.configure(state="normal" if busy else "disabled")
 
     def _notice(self, text, seconds=2.5):
+        LOG.info("NOTICE %s", text)
         self._notice_text, self._notice_until = text, time.monotonic() + seconds
 
     def _take_hotkeys(self):
@@ -1433,9 +1486,11 @@ class App:
         return foreground == self.job.target or bool(foreground and window_pid(foreground) == os.getpid())
 
     def _warn(self, message):
+        LOG.warning("UI warning: %s", message)
         self._modal(messagebox.showwarning, message)
 
     def _error_dialog(self, message):
+        LOG.error("UI error: %s", message)
         self._modal(messagebox.showerror, message)
 
     def _modal(self, show, message):
@@ -1447,6 +1502,7 @@ class App:
             self._take_hotkeys()
 
     def _report_exception(self, exc, value, tb):
+        LOG.error("UI callback exception", exc_info=(exc, value, tb))
         self._error_dialog("예기치 못한 오류가 발생했습니다.\n\n"
                            + "".join(traceback.format_exception(exc, value, tb))[-1500:])
 
@@ -1459,6 +1515,7 @@ class App:
             self._esc_was_down = esc_down
             hotkeys = self._take_hotkeys()
             if esc_pressed and self._esc_applies():
+                LOG.info("HOTKEY ESC emergency stop")
                 self.stop()
                 self._notice("ESC를 눌러 정지했습니다")
             elif HOTKEY_TOGGLE in hotkeys and not self._dialog_open:
@@ -1507,26 +1564,29 @@ class App:
 
 
 def main():
-    if already_running():
-        return
+    base = Path(sys.executable if getattr(sys, 'frozen', False) else __file__).resolve().parent
     try:
-        os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
-        handler = RotatingFileHandler(os.path.join(os.path.dirname(SETTINGS_FILE), "diagnostics.log"),
-                                      maxBytes=262144, backupCount=1, encoding="utf-8")
-        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-        LOG.addHandler(handler)
-        LOG.setLevel(logging.INFO)
-    except OSError:
-        pass
+        setup_logging(base, APP_VERSION)
+    except OSError as error:
+        messagebox.showerror("로그 초기화 실패", f"{base / 'debug'}에 로그를 만들 수 없습니다.\n{error}")
+        return
+    if already_running():
+        LOG.warning("APP duplicate instance; exiting")
+        return
     enable_dpi_awareness()
     root = tk.Tk()
     try:
         App(root)
     except (OSError, ValueError, UnicodeError) as error:
+        LOG.exception("APP initialization failed")
         messagebox.showerror("히스토리 초기화 실패", f"기존 기록을 덮어쓰지 않았습니다.\n{error}", parent=root)
         root.destroy()
         return
-    root.mainloop()
+    try:
+        root.mainloop()
+    finally:
+        LOG.info("APP END")
+        logging.shutdown()
 
 
 if __name__ == "__main__":
