@@ -41,12 +41,21 @@ class HistoryWindow:
         self.load_button = ttk.Button(controls, text="히스토리 불러오기", command=on_load)
         self.load_button.pack(side="right", padx=4)
         ttk.Button(controls, text="오늘 히스토리", command=self.show_current).pack(side="right")
+        self.recovery_button = ttk.Button(controls, text='기록이 누락된 어종 찾기', command=self.request_recovery)
+        self.recovery_button.pack(side='right', padx=4)
+        self.recovery_label = ttk.Label(self.window, padding=(8, 0))
+        self.recovery_label.pack(fill='x')
         self.revenue = ttk.Label(self.window, padding=(8, 6), font=("Malgun Gothic", 13, "bold"))
         self.revenue.pack(fill="x")
         self.summary = ttk.Label(self.window, padding=8, wraplength=1020)
         self.summary.pack(fill="x")
         self.detail = ttk.Label(self.window, padding=8, wraplength=1020)
         self.detail.pack(fill="x")
+        self.warning = ttk.Label(self.window, padding=(8, 0), foreground='#c62828')
+        self.window.bind('<Configure>', self.resize_text, add='+')
+        self.exclude_individual = tk.BooleanVar(value=False)
+        ttk.Checkbutton(self.window, text='개별 세션 낚시 제외', variable=self.exclude_individual,
+                        command=self.refresh).pack(anchor='w', padx=8)
         self.exclude_extra = tk.BooleanVar(value=False)
         self.exclude_extra_button = ttk.Checkbutton(self.window, text='추가낚시 제외 (평균 계산)',
             variable=self.exclude_extra, command=self.refresh)
@@ -77,6 +86,15 @@ class HistoryWindow:
         self.footer = ttk.Label(self.window, text="기록마다 실행 파일 옆 fishing-macro-history 폴더에 자동 저장됩니다. 미확인 값은 — 표시.", padding=8)
         self.footer.pack(fill="x")
         self.poll()
+
+    def resize_text(self, event):
+        if event.widget == self.window:
+            for label in (self.summary, self.detail, self.warning):
+                label.configure(wraplength=max(100, event.width - 32))
+
+    def request_recovery(self):
+        self.current_history.request_recovery()
+        self.refresh()
 
     def change_tab(self, event=None):
         self.mode.set(MODES[self.tabs.index(self.tabs.select())])
@@ -121,6 +139,8 @@ class HistoryWindow:
         state = "disabled" if self.is_busy() else "normal"
         self.load_button.configure(state=state)
         self.delete_button.configure(state=state)
+        self.recovery_button.configure(state='disabled' if self.source_path or self.current_history.recovery_pending else 'normal')
+        self.recovery_label.configure(text=self.current_history.recovery_status)
         if self.version != self.history.version:
             self.refresh()
         self.timer = self.window.after(1000, self.poll)
@@ -139,6 +159,12 @@ class HistoryWindow:
 
     def refresh(self):
         all_records = self.history.snapshot()
+        if self.exclude_individual.get():
+            all_records = [r for r in all_records if not r.get('individual_session')]
+        if self.mode.get() == '개별 세션':
+            all_records = [r for r in all_records if r.get('individual_session')]
+        self.recovery_label.configure(text=self.current_history.recovery_status)
+        self.recovery_button.configure(state='disabled' if self.source_path or self.current_history.recovery_pending else 'normal')
         raid_mode = self.mode.get() == '레이드'
         columns, labels = (RAID_COLUMNS, RAID_LABELS) if raid_mode else (COLUMNS, LABELS)
         if self.columns != columns:
@@ -166,7 +192,17 @@ class HistoryWindow:
         totals = " / ".join(f"{g} {sum(r.get('grade') == g for r in fish):,}마리" for g in (GRADES if grade == "전체" else (grade,)))
         unknown_exp = sum('exp' not in r for r in fish)
         unknown_fish = sum('species' not in r for r in fish)
-        self.detail.configure(text=totals + f"\n어종 미확인 {unknown_fish}건 · 획득 EXP 미표기 {unknown_exp}건 (합계에서 제외)")
+        self.detail.configure(text=totals)
+        warnings = []
+        if unknown_fish:
+            warnings.append(f'어종 미확인 {unknown_fish}건')
+        if unknown_exp:
+            warnings.append(f'획득 EXP 미표기 {unknown_exp}건 (합계에서 제외)')
+        self.warning.configure(text=' · '.join(warnings))
+        if warnings and not raid_mode:
+            self.warning.pack(fill='x', after=self.detail)
+        else:
+            self.warning.pack_forget()
         mode, grade = self.mode.get(), self.grade.get()
         rows = sort_rows(make_rows(all_records, mode, grade), self.sort_column, self.sort_direction)
         if raid_mode:

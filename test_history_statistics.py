@@ -31,7 +31,7 @@ class StatisticsTests(unittest.TestCase):
     def test_tab_order_and_window_average_toggle(self):
         import tkinter as tk
         from history_window import HistoryWindow
-        self.assertEqual(MODES, ('전체','어종','구간','행운','진주','도감','자동어','레이드'))
+        self.assertEqual(MODES, ('전체','어종','구간','행운','진주','도감','자동어','레이드','개별 세션'))
         root=tk.Tk(); root.withdraw()
         history=History()
         history.update(1, catch(1, grade='일반', gold=100))

@@ -137,6 +137,15 @@ class History:
         self.path = path
         self.saved_version = 0
         self.save_error = None
+        self.recovery_pending = False
+        self.recovery_attempted = set()
+        self.recovery_status = ''
+
+    def request_recovery(self):
+        with self._lock:
+            self.recovery_pending = True
+            self.recovery_status = '다음 낚시 결과를 복사할 때 한 번 검사합니다.'
+            self.version += 1
 
     def new_id(self):
         with self._lock:
@@ -288,6 +297,13 @@ class Observer:
         self.previous = messages(text)
 
     def observe(self, text):
+        self.observed_catch = False
+        self._observe(text)
+        if self.observed_catch:
+            from history_recovery import recover_missing
+            recover_missing(self.history, text, self.user, self.bot)
+
+    def _observe(self, text):
         if self.awaiting_baseline:
             self.baseline(text)
             self.awaiting_baseline = False
@@ -356,7 +372,7 @@ class Observer:
             context["kind"] = data["kind"]
         if "species" in data or "pearls" in data or "damage" in data:
             context["complete"] = True
-        if owner != self.user:
+        if owner != self.user and not getattr(self, 'capture_all', False):
             return
         if command == "가방":
             count = number(context["text"], r"미끼:\s*([\d,]+)\s*개")
@@ -369,13 +385,15 @@ class Observer:
             return
         if not data:
             return
+        if data.get('kind') in ('fish', 'pearl', 'auto', 'raid'):
+            self.observed_catch = True
         if "today" in data:
             self.today = data["today"]
         if "limit" in data:
             self.limit = data["limit"]
-        if data.get("kind") == "auto":
+        if data.get("kind") == "auto" and not getattr(self, 'capture_all', False):
             data.setdefault("today", (self.today or 0) + 1)
-        if data.get("kind") == "raid" and self.limit:
+        if data.get("kind") == "raid" and self.limit and not getattr(self, 'capture_all', False):
             data.setdefault("today", self.limit)
             data.setdefault("limit", self.limit)
         data["user"] = owner

@@ -294,6 +294,7 @@ class WindowTests(unittest.TestCase):
             self.assertNotIn('▲',window.tree.heading('time')['text'])
             for mode in MODES:
                 window.mode.set(mode); window.refresh()
+            window.mode.set('레이드'); window.refresh()
             self.assertIn('레이드 보상',window.revenue.cget('text'))
             from history_view import RAID_COLUMNS
             self.assertEqual(window.tree['columns'], RAID_COLUMNS)

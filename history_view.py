@@ -3,7 +3,7 @@ from fishing_history import GRADES, sale_percent, EFFECTS
 
 COLUMNS = ('time', 'band', 'today', 'species', 'grade', 'count', 'size', 'gold', 'exp', 'extra')
 LABELS = ('시간', '구간', '오늘 낚시', '어종 / 종류', '등급', '누적 수', '크기(cm)', '획득 골드', '획득 EXP', '상세')
-MODES = ('전체', '어종', '구간', '행운', '진주', '도감', '자동어', '레이드')
+MODES = ('전체', '어종', '구간', '행운', '진주', '도감', '자동어', '레이드', '개별 세션')
 
 
 def canonical_mode(mode):
@@ -29,6 +29,10 @@ def row_for(group, grouped=False):
     golds = [r['gold'] for r in group if 'gold' in r]
     exps = [r['exp'] for r in group if 'exp' in r]
     detail = []
+    if latest.get('recovered'):
+        detail.append('누락 복구')
+    if latest.get('individual_session'):
+        detail.append('개별 세션')
     if latest.get('boss_name'):
         detail.append(latest.get('raid_type', '레이드') + ': ' + latest['boss_name'])
     for key, title in (('pearls', '진주'), ('damage', '데미지'), ('stones', '해신석'), ('bonus', '달성 보상 G')):
@@ -74,6 +78,8 @@ def make_rows(records, mode, grade='전체'):
         r['_cumulative'] = counters[key]
         annotated.append(r)
     chosen = [r for r in annotated if grade == '전체' or r.get('grade') == grade]
+    if mode == '개별 세션':
+        chosen = [r for r in chosen if r.get('individual_session')]
     if mode in ('어종', '구간별', '도감 완성'):
         chosen = [r for r in chosen if r['kind'] == 'fish']
         if mode == '도감 완성':

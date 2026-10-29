@@ -11,10 +11,12 @@ FIELDS = ('id', 'time', 'user', 'kind', 'species', 'grade', 'size', 'today', 'li
           'collection', 'luck_remaining', 'lucky', 'luck_granted', 'enhancement', 'card_attribute',
           'frost_remaining', 'fire_remaining', 'frost_active', 'fire_active',
           'frost_granted', 'fire_granted', 'any_lucky',
-          'boss_name', 'raid_type', 'hp_current', 'hp_max', 'hp_percent', 'phase')
+          'boss_name', 'raid_type', 'hp_current', 'hp_max', 'hp_percent', 'phase',
+          'recovered', 'individual_session')
 INTEGERS = {'id', 'today', 'limit', 'gold', 'multiplier', 'balance', 'exp', 'pearls',
             'damage', 'stones', 'bonus', 'luck_remaining', 'enhancement', 'frost_remaining', 'fire_remaining', 'hp_current', 'hp_max'}
 BOOLEANS = {'collection', 'lucky', 'luck_granted', 'frost_active', 'fire_active', 'frost_granted', 'fire_granted', 'any_lucky'}
+BOOLEANS.update(('recovered', 'individual_session'))
 
 
 def save_csv(path, records):
