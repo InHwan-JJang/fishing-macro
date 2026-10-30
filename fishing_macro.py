@@ -30,11 +30,11 @@ from ctypes import wintypes as wt
 from tkinter import messagebox, ttk, filedialog
 from pathlib import Path
 from history_storage import delete_past_files
-from fishing_history import DailyHistory, History, Observer, now_kst, next_reset, parse_details
+from fishing_history import DailyHistory, History, Observer, CatchCounters, now_kst, next_reset, parse_details
 from history_window import HistoryWindow
 
 APP_TITLE = "낚시 매크로"
-APP_VERSION = "1.3.2"
+APP_VERSION = "1.3.3"
 ICON_FILE = "fishing.ico"
 ROOM_PREFIX = "낚시"            # 이 글자로 시작하는 카톡 채팅방을 찾음
 TEXT_FISH, TEXT_MANUAL = "낚시", "수동"
@@ -602,41 +602,40 @@ def limit_hit(reply, limit):
 
 def limit_hit_after_my_command(text, user, limit):
     """내 마지막 명령 뒤에 온 봇 메시지 중 한도 도달을 뜻하는 것이 있는지. (한도 직전에만 사용)"""
-    hit = False
-    for sender, body in parse_messages(text):
-        if sender == user and COMMAND_RE.match(body):
-            hit = False
-        elif body.startswith("@사용자") and limit_hit(classify_reply(body), limit):
-            hit = True
-    return hit
+    replies = my_replies(text, user)
+    return bool(replies and limit_hit(replies[-1][1], limit))
 
 
 def my_replies(text, user):
     """내 명령("@봇 낚시"/"@봇 수동")마다 짝지어진 봇 답장. 봇은 "@사용자 …"로 답하므로(이름이 복사되지 않음)
     명령 순서대로 답장을 짝짓습니다. 마지막 원소가 내 마지막 명령이고, 답장이 아직 없으면 None입니다."""
     pending, results = deque(), []
+    counters = CatchCounters()
+    day = now_kst().date().isoformat()
+    bot = None
     for sender, body in parse_messages(text):
         cmd = COMMAND_RE.match(body)
         if cmd and sender != cmd.group(1):
-            pending.append((sender, cmd.group(2)))
+            bot = cmd.group(1)
+            index = len(results) if sender == user else None
+            pending.append((sender, cmd.group(2), index))
             if sender == user:
                 results.append([cmd.group(2), None])
-        elif body.startswith("@사용자") and pending:
-            who, _ = pending.popleft()
-            if who == user:
-                results[-1][1] = classify_reply(body)
+        elif sender == bot and (body.startswith("@사용자") or body.startswith("@" + user)):
+            details = parse_details(body)
+            matched = counters.take(pending, details, day)
+            if matched:
+                who, _, index = matched
+                counters.remember(who, details, day)
+                if who == user:
+                    results[index][1] = classify_reply(body)
     return [tuple(r) for r in results]
 
 
 def latest_reply_after_my_command(text, user):
-    """내 마지막 명령 뒤에 온 봇 답장 중 가장 최근 것(짝짓기가 어긋났을 때의 보조 수단). 없으면 None."""
-    latest = None
-    for sender, body in parse_messages(text):
-        if sender == user and COMMAND_RE.match(body):
-            latest = None
-        elif body.startswith("@사용자"):
-            latest = classify_reply(body)
-    return latest
+    """Use the same ownership and counter checks for the fallback response."""
+    replies = my_replies(text, user)
+    return replies[-1][1] if replies else None
 
 
 def format_duration(seconds):
@@ -907,9 +906,9 @@ class MacroJob:
                 self._limit_seen or (self.today is not None and self.limit is not None and self.today >= self.limit))
 
     def _stale(self, reply):
-        """'낚시 성공' 답장인데 오늘 횟수가 늘지 않았으면 남의 것이거나 이전 것."""
+        """현재 순번의 바로 다음 낚시가 아니면 불확실한 응답으로 제외합니다."""
         return reply and (reply[0] == "success" or (reply[0] == 'extra_success' and getattr(self, 'phase', None) == 'extra')) and reply[1] is not None and self.today is not None \
-            and reply[1] <= self.today
+            and reply[1] != self.today + 1
 
     def _send_text(self, text):
         LOG.debug("INPUT text=%r", text)

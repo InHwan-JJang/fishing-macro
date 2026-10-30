@@ -139,6 +139,43 @@ def messages(text):
     return [tuple(item) for item in result]
 
 
+class CatchCounters:
+    """Match counted replies only to a player's next catch, separately per phase/day."""
+    def __init__(self):
+        self.counts = {}
+
+    def key(self, owner, data, day):
+        return (day, owner, data.get('phase', 'daily'))
+
+    def accepts(self, owner, data, day):
+        count = data.get('today')
+        previous = self.counts.get(self.key(owner, data, day))
+        return count is None or previous is None or count == previous + 1
+
+    def remember(self, owner, data, day):
+        if data.get('today') is not None and data.get('kind') in ('fish', 'pearl'):
+            self.counts[self.key(owner, data, day)] = data['today']
+
+    def take(self, pending, data, day):
+        if not pending:
+            return None
+        counted = data.get('today') is not None
+        compatible = [p for p in pending if (not counted or p[1] == '낚시') and self.accepts(p[0], data, day)]
+        exact = [p for p in compatible if self.key(p[0], data, day) in self.counts] if counted else []
+        choices = exact or compatible
+        if not choices:
+            LOG.warning('REPLY counter mismatch count=%s phase=%s pending=%r counters=%r',
+                        data.get('today'), data.get('phase', 'daily'), list(pending), self.counts)
+            return None
+        # Different known players with the same next count cannot be distinguished.
+        if exact and len({p[0] for p in exact}) > 1:
+            LOG.warning('REPLY ambiguous counter count=%s owners=%r', data['today'], [p[0] for p in exact])
+            return None
+        chosen = choices[0]
+        pending.remove(chosen)
+        return chosen
+
+
 class History:
     """One application session; records survive stopping/restarting a job."""
     def __init__(self, path=None):
@@ -159,6 +196,16 @@ class History:
             self.recovery_pending = True
             self.recovery_status = '다음 낚시 결과를 복사할 때 한 번 검사합니다.'
             self.version += 1
+
+    def discard_response(self, key):
+        """Remove an incomplete response when a later counter disproves ownership."""
+        with self._lock:
+            record = self.records.pop(key, None)
+            if record is not None:
+                if hasattr(self, 'dirty_days'):
+                    self.dirty_days.add(record['time'][:10])
+                self.version += 1
+                self.save()
 
     def new_id(self):
         with self._lock:
@@ -309,6 +356,7 @@ class Observer:
         self.bag_count = None
         self.bag_version = 0
         self.awaiting_baseline = False
+        self.counters = CatchCounters()
 
     def baseline(self, text):
         LOG.debug("OBSERVER baseline chars=%s user=%r", len(text), self.user)
@@ -365,14 +413,14 @@ class Observer:
         if not details.get("kind") and ("숨을 고른" in body or "아직" in body):
             details["kind"] = "other"
         if body.startswith("@사용자") or body.startswith("@" + self.user):
-            if self.pending:
-                owner, command, key = self.pending.popleft()
-                self.active = dict(owner=owner, command=command, key=key, text="", kind=details.get("kind"), complete=False)
-                self.responses.append(self.active)
-            elif details.get("kind"):
-                # A result without a corresponding command must not overwrite
-                # the preceding player's catch (e.g. a missed command).
-                self.active = None
+            day = getattr(self.history, 'stamp', now_kst()).date().isoformat()
+            matched = self.counters.take(self.pending, details, day)
+            owner, command, key = matched if matched else (None, '낚시', None)
+            # Keep a rejected response slot so its following card cannot leak
+            # into another player's incomplete result.
+            self.active = dict(owner=owner, command=command, key=key, text="", kind=details.get("kind"),
+                               complete=False, rejected=matched is None, checked_count=None, day=day)
+            self.responses.append(self.active)
         elif details.get('kind') == 'operator' or details.get("species") or "pearls" in details or "damage" in details or "boss_name" in details or "미끼:" in body:
             card_kind = ('operator' if details.get('kind') == 'operator' else "fish" if "species" in details else "pearl" if "pearls" in details
                          else "raid" if "damage" in details or "boss_name" in details else "bag")
@@ -393,6 +441,16 @@ class Observer:
             context["kind"] = data["kind"]
         if "species" in data or "pearls" in data or "damage" in data or (data.get('kind') == 'operator' and 'gold' in data):
             context["complete"] = True
+        if context.get('rejected'):
+            return
+        if data.get('today') is not None and context.get('checked_count') != data['today']:
+            if not self.counters.accepts(owner, data, context['day']):
+                context['rejected'] = True
+                self.history.discard_response(key)
+                LOG.warning('HISTORY counter mismatch owner=%r count=%s; response discarded', owner, data['today'])
+                return
+            self.counters.remember(owner, data, context['day'])
+            context['checked_count'] = data['today']
         if owner != self.user and not getattr(self, 'capture_all', False):
             return
         if command == "가방":

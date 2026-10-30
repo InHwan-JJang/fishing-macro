@@ -97,11 +97,14 @@ class RecoveryTests(unittest.TestCase):
         self.assertFalse(missing_runs(self.h.snapshot(), '나', DAY))
         self.assertEqual(len(self.run_recovery(DATE + '\n' + catch(777, 110))), 1)
 
-    def test_unique_counter_ignores_balance_and_command_owner(self):
+    def test_unique_counter_ignores_balance_but_not_explicit_foreign_owner(self):
         for owner in ('나', '친구', ''):
             with self.subTest(owner=owner):
                 self.setUp()
                 rows = self.run_recovery(DATE + '\n' + catch(777, 999, owner))
+                if owner == '친구':
+                    self.assertEqual(rows, [])
+                    continue
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0]['balance'], 999)
 

@@ -142,7 +142,8 @@ class ObserverTests(unittest.TestCase):
 
     def catch(self, species='하프 물범', effect=''):
         self.append('나', '@방구석낚시꾼 낚시')
-        self.append('방구석낚시꾼', '@사용자 낚시 성공!\n획득 골드: 719G (120%)\n경험치: 38EXP (5,607 / 18,120)\n오늘 낚시: 598 / 3,000' + effect)
+        count = self.obs.today + 1 if self.obs.today is not None else 598
+        self.append('방구석낚시꾼', f'@사용자 낚시 성공!\n획득 골드: 719G (120%)\n경험치: 38EXP (5,607 / 18,120)\n오늘 낚시: {count} / 3,000' + effect)
         self.append('방구석낚시꾼', f'[{species}] 114.3cm\n등급: 레어')
 
     def test_split_card_and_duplicate_poll(self):
@@ -176,7 +177,7 @@ class ObserverTests(unittest.TestCase):
         self.assertEqual(list(self.obs.buff_requests), [20])
 
     def test_epic_strong_bite_cards_and_following_normal_catch(self):
-        for species, size, count, gold, exp in [('돌고래','207.5cm',2901,2197,118), ('대왕오징어','3.9m',2912,2500,133)]:
+        for species, size, count, gold, exp in [('돌고래','207.5cm',2901,2197,118), ('대왕오징어','3.9m',2902,2500,133)]:
             body=f'@사용자 강한 입질!\n획득 골드: {gold:,}G\n경험치: {exp}EXP (16,458 / 20,020)\n오늘 낚시: {count:,} / 3,000'
             self.append('나','@방구석낚시꾼 낚시')
             self.append('방구석낚시꾼',body)

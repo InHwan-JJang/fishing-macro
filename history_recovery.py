@@ -149,7 +149,7 @@ def recover_missing(history, text, user, bot):
                 if len(options) == 1:
                     # A unique counter in today's chat is sufficient, including
                     # consecutive gaps. Do not compare or synthesize balances.
-                    matches = options
+                    matches = [r for r in options if r.get('user') in ('', user)]
                 else:
                     expected = previous_balance(following)
                     matches = [r for r in options if r.get('user') in ('', user) and
