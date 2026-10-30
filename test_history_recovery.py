@@ -3,9 +3,9 @@ import unittest
 from pathlib import Path
 
 from fishing_history import History, Observer, now_kst
-from history_recovery import recover_missing, dated_candidates, missing_runs
+from history_recovery import recover_missing, dated_candidates, missing_runs, interpolate_recovered_times
 from history_storage import load_records, save_csv
-from history_view import make_rows
+from history_view import make_rows, sort_rows
 
 
 DAY = now_kst().date().isoformat()
@@ -42,6 +42,51 @@ class RecoveryTests(unittest.TestCase):
     def run_recovery(self, chat):
         recover_missing(self.h, chat, '나', '봇')
         return [r for r in self.h.snapshot() if r.get('recovered')]
+
+    def test_recovery_time_is_midpoint_and_persists(self):
+        self.h.records[1]['time'] = DAY + 'T14:50:10+09:00'
+        self.h.records[2]['time'] = DAY + 'T14:50:20+09:00'
+        rows = self.run_recovery(DATE + '\n' + catch(777, 110))
+        self.assertEqual(rows[0]['time'], DAY + 'T14:50:15+09:00')
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as folder:
+            path = Path(folder) / 'history.csv'
+            save_csv(path, self.h.snapshot())
+            loaded = load_records(path)
+            self.assertEqual([r['today'] for r in make_rows(loaded, '전체')], [778, 777, 776])
+            self.assertEqual([r['today'] for r in sort_rows(make_rows(loaded, '전체'), 'time', 1)], [776, 777, 778])
+
+    def test_consecutive_recovery_times_evenly_spaced_across_minute(self):
+        self.h.records[1]['time'] = DAY + 'T14:50:58+09:00'
+        self.h.records[2].update(today=780, time=DAY + 'T14:51:06+09:00')
+        rows = self.run_recovery(DATE + '\n' + '\n'.join(catch(n, 110) for n in (777, 778, 779)))
+        self.assertEqual([r['time'] for r in sorted(rows, key=lambda r: r['today'])],
+                         [DAY + 'T14:51:00+09:00', DAY + 'T14:51:02+09:00', DAY + 'T14:51:04+09:00'])
+
+    def test_fractional_midpoint_sorts_in_both_directions(self):
+        self.h.records[1]['time'] = DAY + 'T14:50:10+09:00'
+        self.h.records[2]['time'] = DAY + 'T14:50:11+09:00'
+        rows = self.run_recovery(DATE + '\n' + catch(777, 110))
+        self.assertEqual(rows[0]['time'], DAY + 'T14:50:10.500000+09:00')
+        view = make_rows(self.h.snapshot(), '전체')
+        self.assertEqual([r['today'] for r in sort_rows(view, 'time', 1)], [776, 777, 778])
+        self.assertEqual([r['today'] for r in sort_rows(view, 'time', 2)], [778, 777, 776])
+
+    def test_missing_or_ambiguous_neighbor_keeps_original_time(self):
+        candidate = dict(kind='fish', today=777, user='나', time=DAY + 'T13:00:00+09:00')
+        for records in ([self.h.records[2]], [self.h.records[1]],
+                        [self.h.records[1], dict(self.h.records[1]), self.h.records[2]],
+                        [dict(self.h.records[1], user='친구'), self.h.records[2]],
+                        [dict(self.h.records[1], phase='extra'), self.h.records[2]]):
+            row = dict(candidate)
+            interpolate_recovered_times([row], records, '나', DAY)
+            self.assertEqual(row['time'], candidate['time'])
+
+    def test_equal_or_reversed_anchor_times_are_not_changed(self):
+        for second in ('00', '10'):
+            self.h.records[1]['time'] = DAY + f'T13:00:{second}+09:00'
+            rows = self.run_recovery(DATE + '\n' + catch(777, 110))
+            self.assertEqual(rows[0]['time'], DAY + 'T13:00:00+09:00')
+            self.setUp()
 
     def test_single_duplicate_count_selects_gold_chain(self):
         rows = self.run_recovery(DATE + '\n' + catch(777, 510, '친구') + '\n' + catch(777, 110))

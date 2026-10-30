@@ -87,6 +87,35 @@ def previous_balance(record):
     return record['balance'] - gold - record.get('bonus', 0)
 
 
+def interpolate_recovered_times(recovered, records, user, day):
+    """Place a consecutive recovered run between its known adjacent catches."""
+    if not recovered:
+        return
+    ordered = sorted(recovered, key=lambda r: r['today'])
+    low, high = ordered[0]['today'], ordered[-1]['today']
+    if [r['today'] for r in ordered] != list(range(low, high + 1)):
+        return
+    def neighbors(count):
+        return [r for r in records if r.get('user') == user and r['time'][:10] == day
+                and r.get('phase') != 'extra' and r.get('today') == count
+                and r['kind'] in ('fish', 'pearl', 'auto', 'raid')]
+    before, after = neighbors(low - 1), neighbors(high + 1)
+    if len(before) != 1 or len(after) != 1:
+        return  # No predecessor (or ambiguous neighbors): keep the copied time.
+    start, end = datetime.fromisoformat(before[0]['time']), datetime.fromisoformat(after[0]['time'])
+    if end <= start:
+        LOG.warning('RECOVERY time interpolation skipped counts=%s..%s non-increasing anchors', low, high)
+        return
+    stamps = [start + (end - start) * index / (len(ordered) + 1)
+              for index in range(1, len(ordered) + 1)]
+    if not all(a < b for a, b in zip([start] + stamps, stamps + [end])):
+        return
+    for record, stamp in zip(ordered, stamps):
+        old = record['time']
+        record['time'] = stamp.isoformat(timespec='microseconds' if stamp.microsecond else 'seconds')
+        LOG.info('RECOVERY estimated time count=%s original=%s interpolated=%s', record['today'], old, record['time'])
+
+
 def recover_missing(history, text, user, bot):
     day = now_kst().date().isoformat()
     with history._lock:
@@ -109,6 +138,7 @@ def recover_missing(history, text, user, bot):
             if len(anchors) != 1:
                 continue
             following = anchors[0]
+            recovered_run = []
             for count in range(hi, lo - 1, -1):
                 options = [r for r in candidates if r.get('today') == count and r.get('phase') != 'extra']
                 # Repeated copies of the identical result are one candidate.
@@ -133,9 +163,12 @@ def recover_missing(history, text, user, bot):
                 individual = hi > lo or any(r.get('individual_session') and r.get('user') == user and
                     r['time'][:10] == day and r.get('today') in (lo - 1, hi + 1) for r in records)
                 recovered.update(user=user, recovered=True, individual_session=individual)
+                recovered_run.append(recovered)
+                following = recovered
+            interpolate_recovered_times(recovered_run, records, user, day)
+            for recovered in sorted(recovered_run, key=lambda r: r['today']):
                 history.update(history.new_id(), recovered)
                 added += 1
-                following = recovered
         history.recovery_status = f'누락 검사 완료: {added}건 복구'
         remaining = sum(hi - lo + 1 for lo, hi in missing_runs(history.snapshot(), user, day))
         if remaining:

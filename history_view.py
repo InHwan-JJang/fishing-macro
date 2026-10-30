@@ -13,8 +13,8 @@ RAID_LABELS = ('시간', '보스명', '조우 유형', '데미지', '보상 골�
 
 
 def raid_rows(records):
-    return [{key: (r['time'][:19].replace('T', ' ') if key == 'time' else r.get(key))
-             for key in RAID_COLUMNS}
+    return [dict({key: (r['time'][:19].replace('T', ' ') if key == 'time' else r.get(key))
+                  for key in RAID_COLUMNS}, _time_order=r['time'])
             for r in sorted(records, key=lambda r: (r['time'], r['id']), reverse=True)
             if r['kind'] == 'raid']
 
@@ -58,7 +58,7 @@ def row_for(group, grouped=False):
         detail.append(f"{latest['enhancement']}강")
     elif latest.get('card_attribute'):
         detail.append(latest['card_attribute'])
-    return dict(time=latest['time'][:19].replace('T', ' '), band=sale_percent(latest),
+    return dict(time=latest['time'][:19].replace('T', ' '), _time_order=latest['time'], band=sale_percent(latest),
                 today=latest.get('today'), limit=latest.get('limit'), phase=latest.get('phase'),
                 species=latest.get('species', latest.get('boss_name', {'auto':'자동어', 'pearl':'진주', 'raid':'레이드', 'operator':'운영자 출현'}.get(latest['kind'], '어종 미확인'))),
                 grade=latest.get('grade', ''), count=latest.get('_cumulative', len(group)), size=latest.get('size'),
@@ -113,7 +113,8 @@ def sort_rows(rows, column=None, direction=0):
     known, missing = [], []
     for row in rows:
         (missing if row.get(column) is None or (column == 'grade' and row['grade'] not in GRADES) else known).append(row)
-    key = (lambda r: GRADES.index(r['grade'])) if column == 'grade' else (lambda r: r[column])
+    key = ((lambda r: GRADES.index(r['grade'])) if column == 'grade' else
+           (lambda r: r.get('_time_order', r['time'])) if column == 'time' else (lambda r: r[column]))
     return sorted(known, key=key, reverse=direction == 2) + missing
 
 
