@@ -16,6 +16,7 @@ import ctypes
 import json
 import logging
 from debug_logging import LOG, setup_logging, traced
+from input_trace import INPUT_TAG, MentionTrace
 import os
 import queue
 import re
@@ -34,7 +35,8 @@ from fishing_history import DailyHistory, History, Observer, CatchCounters, now_
 from history_window import HistoryWindow
 
 APP_TITLE = "낚시 매크로"
-APP_VERSION = "1.3.3"
+APP_VERSION = "1.4.0"
+MENTION_TRACE = None
 ICON_FILE = "fishing.ico"
 ROOM_PREFIX = "낚시"            # 이 글자로 시작하는 카톡 채팅방을 찾음
 TEXT_FISH, TEXT_MANUAL = "낚시", "수동"
@@ -43,15 +45,11 @@ WAIT_S = 3.0                    # 반복 대기
 REPEAT_RANGE = (0, 9999)
 DEFAULT_REPEAT = 4000
 REPLY_FIRST_POLL_S = 0.5        # Enter 뒤 처음 채팅을 읽기까지 (봇 답장은 보통 1초 안에 옴)
-REPLY_POLL_S = 0.5              # 답장이 아직 없으면 이 간격으로 다시 읽음 (읽기 1회 ≈ 0.2초)
 MAX_AUTO_RELEASE = 3            # 자동어 해제를 연속으로 시도하는 최대 횟수
 KEY_HOLD_S = 0.03
 CHAR_GAP_S = 0.01
 RESUME_DELAY_S = 0.5
 RESPONSE_TIMEOUT_MS = 500
-ENTER_READY_TIMEOUT_S = 1.0
-SEND_CHECK_TIMEOUT_S = 1.5
-ENTER_RETRIES = 2
 MAX_READ_CHARS = 100000
 POLL_MS = 50
 UI_FONT = "Malgun Gothic"
@@ -61,7 +59,6 @@ CLIPBOARD_PRIVATE_FORMATS = ("ExcludeClipboardContentFromMonitorProcessing", "Ca
 WAIT_MESSAGES = {
     "window": "채팅방을 다시 클릭하면 계속합니다",
     "keys": "Shift·Ctrl·Alt를 떼면 계속합니다",
-    "draft": "입력창의 글을 보내거나 지우면 계속합니다",
     "busy": "카톡이 응답하지 않아 기다리는 중",
     "unsent": "메시지가 안 보내짐 · 입력창을 정리하면 계속",
     "reply": "봇 답장을 기다리는 중",
@@ -74,6 +71,7 @@ KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, KEYEVENTF_SCANCODE = 0x0002, 0x0004, 0x0008
 MAPVK_VK_TO_VSC = 0
 VK_RETURN, VK_SHIFT, VK_CONTROL, VK_MENU, VK_ESCAPE = 0x0D, 0x10, 0x11, 0x12, 0x1B
 VK_LWIN, VK_RWIN, VK_A, VK_C, VK_F9 = 0x5B, 0x5C, 0x41, 0x43, 0x78
+VK_BACK = 0x08
 MODIFIER_VKS = (VK_SHIFT, VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN)
 CF_UNICODETEXT = 13
 GMEM_MOVEABLE = 0x0002
@@ -276,6 +274,7 @@ def bring_to_front(hwnd):
 def focus_control(hwnd):
     """다른 프로그램의 컨트롤에 키보드 포커스를 줍니다 (그 창이 앞에 있을 때)."""
     me, other = GetCurrentThreadId(), GetWindowThreadProcessId(hwnd, None)
+    LOG.debug("FOCUS requested=%s foreground=%s thread=%s", hwnd, GetForegroundWindow(), threading.get_ident())
     attached = other != me and AttachThreadInput(me, other, True)
     try:
         SetFocus(hwnd)
@@ -355,8 +354,10 @@ stuck_scans = set()
 
 
 def _key(scan, flags):
+    LOG.debug("KEY scan=%s flags=%s thread=%s", scan, flags, threading.get_ident())
     inp = INPUT(type=INPUT_KEYBOARD)
     inp.ki.wScan, inp.ki.dwFlags = scan, flags
+    inp.ki.dwExtraInfo = INPUT_TAG
     return SendInput(1, ctypes.byref(inp), ctypes.sizeof(INPUT)) == 1
 
 
@@ -377,7 +378,25 @@ def release_stuck_keys():
 
 def press_keys(*vks):
     """키(조합)를 스캔 코드로 눌렀다 뗍니다."""
+    LOG.debug("KEY chord=%r thread=%s", vks, threading.get_ident())
     scans = [MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) for vk in vks]
+    if len(scans) > 1:
+        # Queue the entire chord together; never leave C queued after a
+        # separately submitted Ctrl release or a focus synchronization.
+        events = (INPUT * (2 * len(scans)))()
+        for event, scan in zip(events, scans + list(reversed(scans))):
+            event.type = INPUT_KEYBOARD
+            event.ki.wScan = scan
+            event.ki.dwFlags = KEYEVENTF_SCANCODE
+            event.ki.dwExtraInfo = INPUT_TAG
+        for event in events[len(scans):]:
+            event.ki.dwFlags |= KEYEVENTF_KEYUP
+        sent = SendInput(len(events), events, ctypes.sizeof(INPUT))
+        if sent != len(events):
+            for scan in reversed(scans[:min(sent, len(scans))]):
+                _release(scan)
+            return False
+        return True
     pressed = []
     try:
         for scan in scans:
@@ -495,7 +514,7 @@ def wait_for_copied_text(before, timeout=3.0, operation_deadline=None):
 def copy_chat(room, deadline=None):
     """채팅방의 대화 내용을 전체 선택·복사해 글로 돌려줍니다. 사용자의 클립보드(글)는 되돌립니다. 실패하면 None."""
     chat_list, edit = find_child(room, LIST_CLASS), find_child(room, EDIT_CLASS)
-    if not chat_list or GetForegroundWindow() != room:
+    if not chat_list or not edit or GetForegroundWindow() != room or modifiers_held():
         return None
     if deadline is not None and time.perf_counter() >= deadline:
         return None
@@ -509,18 +528,25 @@ def copy_chat(room, deadline=None):
         if focus_ok:
             selected = press_keys(VK_CONTROL, VK_A)
             time.sleep(0.1)
-            keys_ok = press_keys(VK_CONTROL, VK_C) and selected
+            if not selected or GetForegroundWindow() != room or not control_has_focus(room, chat_list):
+                return None
+            keys_ok = press_keys(VK_CONTROL, VK_C)
+            if not keys_ok:
+                return None
             # Detach/reattach focus synchronization lets Kakao finish queued
             # keyboard input. Waiting before restoring focus can stall copying.
-            if edit:
-                focus_control(edit)
+            # Reattach to synchronize Kakao's queue, keeping the list focused.
+            # Moving to the edit here can redirect queued A/C into the draft.
+            if GetForegroundWindow() != room or not focus_control(chat_list):
+                return None
             if deadline is None:
                 text = wait_for_copied_text(before)
             else:
                 text = wait_for_copied_text(before, timeout=max(0, deadline-time.perf_counter()), operation_deadline=deadline)
     finally:
-        if edit:
-            focus_control(edit)
+        if text is not None and GetForegroundWindow() == room:
+            if not focus_control(edit):
+                text = None
         if saved is not None and text is not None:
             if deadline is None:
                 set_clipboard(saved)
@@ -529,6 +555,26 @@ def copy_chat(room, deadline=None):
     LOG.info("copy focus=%s keys=%s changed=%s chars=%s", focus_ok, keys_ok,
              GetClipboardSequenceNumber() != before, len(text) if text is not None else None)
     return text
+
+
+def control_has_focus(room, control):
+    info = GUITHREADINFO(cbSize=ctypes.sizeof(GUITHREADINFO))
+    thread_id = GetWindowThreadProcessId(room, None)
+    return bool(thread_id and GetGUIThreadInfo(thread_id, ctypes.byref(info)) and info.hwndFocus == control)
+
+
+def has_new_command(before, after, user):
+    """Require an overlapping snapshot and a newly observed own command."""
+    old, new = parse_messages(before), parse_messages(after)
+    if not old:
+        added = new
+    else:
+        added = []
+        for size in range(min(len(old), len(new)), 0, -1):
+            if old[-size:] == new[:size]:
+                added = new[size:]
+                break
+    return any(sender == user and COMMAND_RE.match(body) for sender, body in added)
 
 
 # ── 채팅 해석 ────────────────────────────────────────────────────────────
@@ -613,10 +659,16 @@ def my_replies(text, user):
     counters = CatchCounters()
     day = now_kst().date().isoformat()
     bot = None
+    last_matched = None
     for sender, body in parse_messages(text):
         cmd = COMMAND_RE.match(body)
         if cmd and sender != cmd.group(1):
             bot = cmd.group(1)
+            last_matched = None
+            # Manual release may have no reply. It must not consume the next
+            # fishing response (especially an uncounted auto-fish warning).
+            if cmd.group(2) == TEXT_FISH:
+                pending = deque(p for p in pending if not (p[0] == sender and p[1] == TEXT_MANUAL))
             index = len(results) if sender == user else None
             pending.append((sender, cmd.group(2), index))
             if sender == user:
@@ -624,11 +676,17 @@ def my_replies(text, user):
         elif sender == bot and (body.startswith("@사용자") or body.startswith("@" + user)):
             details = parse_details(body)
             matched = counters.take(pending, details, day)
+            last_matched = matched
             if matched:
                 who, _, index = matched
                 counters.remember(who, details, day)
                 if who == user:
                     results[index][1] = classify_reply(body)
+        elif sender == bot and "자동어" in body and not body.startswith("@"):
+            # Some replies split the mention/result header and auto-fish card.
+            matched = last_matched or counters.take(pending, {'kind': 'auto'}, day)
+            if matched and matched[0] == user:
+                results[matched[2]][1] = ('auto',)
     return [tuple(r) for r in results]
 
 
@@ -685,6 +743,10 @@ class GlobalHotkeys(threading.Thread):
             PostThreadMessageW(self._thread_id, WM_QUIT, 0, 0)
 
 
+class RestartCommand(Exception):
+    """Focus left the chat while an unsent command was being composed."""
+
+
 class MacroJob:
     """낚시 채팅방에서 낚시 명령을 반복하고 봇 답장을 읽습니다."""
 
@@ -707,7 +769,6 @@ class MacroJob:
         self._last_command = None
         self._limit_seen = False     # 한도 직전 반복에서 '달성 보상'·'추가 낚시' 메시지를 봄
         self._fresh_cycle = True
-        self._clears_after_send = False
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         LOG.info("JOB START target=%s user=%r repeat=%s auto=%s bait=%s", target, user, repeat, auto, bait)
@@ -736,10 +797,11 @@ class MacroJob:
                 return
             initial = copy_chat(self.target)
             if initial is None:
-                self.bait_status = "대화 읽기 실패 · 기록 시작 대기"
-                self.observer.awaiting_baseline = True
+                self.end_reason = "read_failed"
+                return
             else:
                 self.observer.baseline(initial)
+                self._last_chat = initial
             started = time.perf_counter()
             cycles = 0
             next_command = TEXT_FISH
@@ -765,15 +827,19 @@ class MacroJob:
                     next_command = TEXT_FISH
                     continue  # 해제 여부는 다음 낚시 결과로 판단합니다.
                 kind = reply[0] if reply else "none"
+                if kind in ('none', 'other'):
+                    self._unconfirmed_catch = True
                 if self.phase is None and kind in ('success', 'extra_success', 'extra', 'achieve'):
                     self.phase = 'extra' if kind == 'extra_success' else 'daily'
                 if self.observer.today is not None and self.observer.limit is not None:
                     self.today, self.limit = self.observer.today, self.observer.limit
                 if kind == "success":
+                    self._unconfirmed_catch = False
                     self.auto_releases = 0
                     if reply[1] is not None:
                         self.today, self.limit = reply[1], reply[2]
                 elif kind == 'extra_success' and self.phase == 'extra':
+                    self._unconfirmed_catch = False
                     self.auto_releases = 0
                     self.today, self.limit = reply[1], reply[2]
                     self._limit_seen = False
@@ -787,18 +853,9 @@ class MacroJob:
                     continue                        # 자동어 낚시는 횟수에 안 들어감 → 다시
                 cycles += 1
                 self.cycle_s = (time.perf_counter() - started) / cycles
-                if kind not in ("cooldown", "extra"):
+                if kind not in ("cooldown", "extra", "none", "other"):
                     self.done += 1
                 if self._phase_limit_hit(reply):
-                    # Give the final raid/reward card time to arrive before ending the job.
-                    deadline = time.perf_counter() + 2.0
-                    while time.perf_counter() < deadline:
-                        if self._sleep(0.5):
-                            return
-                        if GetForegroundWindow() == self.target:
-                            text = copy_chat(self.target)
-                            if text:
-                                self.observer.observe(text)
                     self.limit = self.limit or DEFAULT_LIMIT
                     self.today = self.limit
                     self.end_reason = 'extra_limit' if self.phase == 'extra' else 'limit'
@@ -817,55 +874,115 @@ class MacroJob:
             release_stuck_keys()
 
     def _command(self, text):
-        """0.0s @, 0.5s Enter + text, 1.0s Enter; reply wait adds 3s."""
+        while not self._stop_event.is_set():
+            self._composing = True
+            self._command_submitted = False
+            try:
+                return self._command_once(text)
+            except RestartCommand:
+                LOG.info("COMMAND interrupted; clear draft and restart text=%r", text)
+            finally:
+                self._composing = False
+            if not self._clear_interrupted_input():
+                return False
+            self._fresh_cycle = False  # resume preparation already focused the input
+            self.waiting = None
+        return False
+
+    def _check_command_focus(self):
+        if (getattr(self, '_composing', False) and not self._command_submitted
+                and GetForegroundWindow() != self.target):
+            raise RestartCommand()
+
+    def _clear_interrupted_input(self):
+        """On resume, press Backspace three times in the target input box."""
+        self.waiting = "window"
+        remaining = 3
+        while not self._stop_event.is_set():
+            if not IsWindow(self.target):
+                self.end_reason = "target_closed"
+                return False
+            if GetForegroundWindow() != self.target or modifiers_held():
+                self._sleep(0.05)
+                continue
+            edit = find_child(self.target, EDIT_CLASS)
+            if not edit or not focus_control(edit):
+                self._sleep(0.05)
+                continue
+            if GetForegroundWindow() != self.target or not control_has_focus(self.target, edit):
+                continue
+            release_stuck_keys()
+            if stuck_scans:
+                self.end_reason = "send_failed"
+                return False
+            if remaining == 0:
+                LOG.info("COMMAND resume Backspace x3 completed")
+                return True
+            if not press_keys(VK_BACK):
+                self.end_reason = "send_failed"
+                return False
+            remaining -= 1
+            if self._sleep(0.1):
+                return False
+        return False
+
+    def _command_once(self, text):
+        """@ → gap → Enter/select mention → command → gap → Enter/send."""
         LOG.info("COMMAND begin text=%r foreground=%s target=%s", text, GetForegroundWindow(), self.target)
         self._last_command = text
-        started = time.perf_counter()
-        if not self._send_text("@"):
-            return False
-        if self._sleep(max(0, started + GAP_S - time.perf_counter()), watch=True) or not self._press_enter("@"):
-            return False
+        self._reply_baseline = getattr(self, '_last_chat', '')
+        self._current_command_seen = text not in (TEXT_FISH, TEXT_MANUAL)
+        if MENTION_TRACE:
+            MENTION_TRACE.begin(self.target)
+        try:
+            if not self._send_text("@"):
+                return False
+            if self._sleep(GAP_S, watch=True) or not self._press_enter("@"):
+                return False
+        finally:
+            if MENTION_TRACE:
+                MENTION_TRACE.end()
         if not self._send_text(text):
             return False
-        if self._sleep(max(0, started + 2 * GAP_S - time.perf_counter()), watch=True):
+        if self._sleep(GAP_S, watch=True):
             return False
         sent = self._press_enter(text)
         LOG.info("COMMAND end text=%r sent=%s", text, sent)
         return sent
 
     def _await_reply(self):
-        """마지막 Enter부터 WAIT_S초 동안 기다리면서 내 명령에 대한 봇 답장을 읽습니다.
-        (읽는 데 걸린 시간만큼 대기가 줄어 한 반복이 늘 같은 길이) 답장을 못 찾으면 (), 정지했으면 None."""
+        """Read at +0.5s; only if unresolved read once more at end minus 0.5s."""
         deadline = self._last_enter + WAIT_S
-        reply, fallback = None, None
+        reply = ()
         self.waiting = "reply"
         try:
-            if self._sleep(max(0, self._last_enter + REPLY_FIRST_POLL_S - time.perf_counter()), watch=True):
-                return None
-            while not self._stop_event.is_set() and deadline - time.perf_counter() >= 0.5:
-                if GetForegroundWindow() == self.target:
-                    text = copy_chat(self.target, deadline=min(time.perf_counter() + 0.8, deadline - 0.2))
-                    if text:
-                        self.observer.observe(text)
-                        replies = my_replies(text, self.user)
-                        if getattr(self, 'phase', None) != 'extra' and self._near_limit() and limit_hit_after_my_command(text, self.user, self.limit):
-                            self._limit_seen = True    # 3000번째는 답장이 둘(성공+달성)로 오기도 함
-                        if replies and replies[-1][1] is not None and not self._stale(replies[-1][1]):
-                            reply = replies[-1][1]
-                            # Keep reading until the deadline so the later fish card is recorded too.
-                        fallback = latest_reply_after_my_command(text, self.user)
-                if time.perf_counter() >= deadline:
-                    break
-                if self._sleep(min(REPLY_POLL_S, max(0.0, deadline - time.perf_counter()))):
+            for offset in (REPLY_FIRST_POLL_S, WAIT_S - 0.5):
+                if self._sleep(max(0, self._last_enter + offset - time.perf_counter()), watch=True):
                     return None
+                if GetForegroundWindow() != self.target:
+                    continue
+                text = copy_chat(self.target, deadline=min(time.perf_counter() + 0.8, deadline - 0.2))
+                if not text:
+                    continue
+                self._last_chat = text
+                self.observer.observe(text)
+                if hasattr(self, '_reply_baseline') and not self._current_command_seen:
+                    self._current_command_seen = has_new_command(self._reply_baseline, text, self.user)
+                    if not self._current_command_seen:
+                        continue
+                replies = my_replies(text, self.user)
+                if getattr(self, 'phase', None) != 'extra' and self._near_limit() and limit_hit_after_my_command(text, self.user, self.limit):
+                    self._limit_seen = True
+                candidate = replies[-1][1] if replies else None
+                if candidate and candidate[0] != 'other' and not self._stale(candidate):
+                    reply = candidate
+                    break
+            if self._sleep(max(0, deadline - time.perf_counter()), watch=True):
+                return None
+            LOG.debug("REPLY selected=%r; maximum two reads per cycle", reply)
+            return reply
         finally:
             self.waiting = None
-        LOG.debug("REPLY selected=%r fallback=%r", reply, fallback)
-        if reply is None:        # 짝짓기가 어긋났으면 내 명령 뒤에 온 마지막 답장을 씀
-            reply = () if fallback is None or self._stale(fallback) else fallback
-        if self._sleep(max(0.0, deadline - time.perf_counter()), watch=True):
-            return None
-        return reply
 
     @traced
     def _use_bait(self, maximum):
@@ -907,6 +1024,10 @@ class MacroJob:
 
     def _stale(self, reply):
         """현재 순번의 바로 다음 낚시가 아니면 불확실한 응답으로 제외합니다."""
+        if (getattr(self, '_unconfirmed_catch', False) and reply
+                and (reply[0] == 'success' or (reply[0] == 'extra_success' and self.phase == 'extra'))
+                and reply[1] is not None and self.today is not None):
+            return reply[1] <= self.today
         return reply and (reply[0] == "success" or (reply[0] == 'extra_success' and getattr(self, 'phase', None) == 'extra')) and reply[1] is not None and self.today is not None \
             and reply[1] != self.today + 1
 
@@ -917,73 +1038,35 @@ class MacroJob:
                 return False
             if not self._wait_until_ready():
                 return False
+            self._check_command_focus()
             self._fresh_cycle = False
             if not type_unicode(piece):
                 LOG.warning("INPUT Unicode failed piece=%r error=%s", piece, ctypes.get_last_error())
                 self.failures += 1
+                return False
         return True
 
     def _press_enter(self, typed):
-        if typed:
-            self._wait_box(lambda text: text.endswith(typed), ENTER_READY_TIMEOUT_S)
-        for attempt in range(1 + ENTER_RETRIES):
-            if not self._wait_until_ready():
-                return False
-            if attempt:
-                self.resent += 1
-            pressed_at = time.perf_counter()
-            LOG.debug("INPUT Enter typed=%r attempt=%s", typed, attempt + 1)
-            if not press_keys(VK_RETURN):
-                LOG.warning("INPUT Enter failed error=%s", ctypes.get_last_error())
-                self.failures += 1
-            self._last_enter = pressed_at
-            self._fresh_cycle = False
-            if not typed:
-                return True
-            sent = self._wait_box(self._sent_check(typed), SEND_CHECK_TIMEOUT_S)
-            LOG.debug("INPUT send check typed=%r result=%s", typed, sent)
-            if self._stop_event.is_set():
-                return False
-            if sent is not False:
-                return True
-        LOG.warning("INPUT retries exhausted typed=%r; waiting for input box cleanup", typed)
-        self.waiting = "unsent"
-        while not self._stop_event.is_set():
-            if GetForegroundWindow() == self.target:
-                text = focused_text(self.target)
-                if text is None or not text.endswith(typed):
-                    self.waiting = None
-                    return True
-            self._sleep(0.2)
-        return False
-
-    def _sent_check(self, typed):
-        def sent(text):
-            if not text:
-                self._clears_after_send = True
-            return not text.endswith(typed)
-        return sent
-
-    def _wait_box(self, predicate, timeout):
-        deadline = time.perf_counter() + timeout
-        text = None
-        while True:
-            if GetForegroundWindow() == self.target:
-                text = focused_text(self.target)
-                if text is None:
-                    LOG.debug("INPUT box unavailable")
-                    return None
-                if predicate(text):
-                    LOG.debug("INPUT box matched text=%r", text[:300])
-                    return True
-            if time.perf_counter() >= deadline:
-                LOG.warning("INPUT box timeout seconds=%s text=%r", timeout, text[:300] if text else text)
-                return False
-            if self._sleep(0.03):
-                return None
+        selecting = typed == "@"
+        if not self._wait_until_ready():
+            return False
+        # Each Enter has exactly one purpose. Never retry selection Enter:
+        # a second Enter could send the mention as a standalone message.
+        self._check_command_focus()
+        if not press_keys(VK_RETURN):
+            self.failures += 1
+            self.end_reason = "send_failed"
+            return False
+        self._last_enter = time.perf_counter()
+        if not selecting:
+            self._command_submitted = True
+        self._fresh_cycle = False
+        LOG.debug("INPUT Enter typed=%r sent; no input-box confirmation", typed)
+        return not self._stop_event.is_set()
 
     def _wait_until_ready(self):
         while not self._stop_event.is_set():
+            self._check_command_focus()
             reason = self._blocker()
             if reason != getattr(self, "_logged_blocker", None):
                 LOG.info("INPUT readiness reason=%s foreground=%s target=%s", reason, GetForegroundWindow(), self.target)
@@ -993,6 +1076,9 @@ class MacroJob:
                     return True
                 self.waiting = None
                 self._sleep(RESUME_DELAY_S)
+            elif reason == "input_failed":
+                self.end_reason = "send_failed"
+                return False
             elif reason == "closed":
                 self.end_reason = "target_closed"
                 return False
@@ -1004,18 +1090,26 @@ class MacroJob:
     def _blocker(self):
         if GetForegroundWindow() != self.target:
             return "window" if IsWindow(self.target) else "closed"
-        release_stuck_keys()
+        # Key cleanup is an input too: do it before @, never while the
+        # mention selector is open or a command is being composed.
+        if self._fresh_cycle:
+            release_stuck_keys()
+        if stuck_scans:
+            return "input_failed"
         if modifiers_held():
             return "keys"
         if not is_responsive(self.target):
             return "busy"
-        if self._fresh_cycle and self._clears_after_send and focused_text(self.target):
-            return "draft"
+        if self._fresh_cycle:
+            edit = find_child(self.target, EDIT_CLASS)
+            if not edit or not focus_control(edit):
+                return "busy"
         return None
 
     def _sleep(self, seconds, watch=False):
         deadline = time.perf_counter() + seconds
         while not self._stop_event.is_set():
+            self._check_command_focus()
             if watch and GetForegroundWindow() != self.target:
                 self.waiting = "window"
             remaining = deadline - time.perf_counter()
@@ -1447,6 +1541,12 @@ class App:
         elif job.end_reason == "stuck_auto":
             self._idle = (f"자동어 해제 실패로 정지 · {progress}",
                           "3회 해제 후에도 자동어가 나타났습니다 · 직접 확인해 주세요")
+        elif job.end_reason in ("read_failed", "reply_unconfirmed"):
+            self._idle = (f"대화 확인 실패로 정지 · {progress}",
+                          "복사 또는 새 봇 응답을 확인하지 못했습니다 · 채팅방 확인 후 다시 시작해 주세요")
+        elif job.end_reason == "send_failed":
+            self._idle = (f"키 입력 실패로 정지 · {progress}",
+                          "입력창의 명령을 확인해 주세요")
         elif job.error:
             self._idle = (f"오류로 정지 · {progress}", "")
             self._error_dialog("입력 도중 오류가 발생해 정지했습니다.\n\n" + job.error[-1500:])
@@ -1563,6 +1663,7 @@ class App:
 
 
 def main():
+    global MENTION_TRACE
     base = Path(sys.executable if getattr(sys, 'frozen', False) else __file__).resolve().parent
     try:
         setup_logging(base, APP_VERSION)
@@ -1582,8 +1683,12 @@ def main():
         root.destroy()
         return
     try:
+        MENTION_TRACE = MentionTrace()
+        MENTION_TRACE.start()
         root.mainloop()
     finally:
+        if MENTION_TRACE:
+            MENTION_TRACE.stop()
         LOG.info("APP END")
         logging.shutdown()
 

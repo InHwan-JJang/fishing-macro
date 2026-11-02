@@ -189,13 +189,25 @@ class History:
         self.recovery_pending = False
         self.recovery_attempted = set()
         self.recovery_status = ''
+        self.recovery_source = None
 
     @traced
     def request_recovery(self):
         with self._lock:
             self.recovery_pending = True
-            self.recovery_status = '다음 낚시 결과를 복사할 때 한 번 검사합니다.'
+            self.recovery_status = '대화 자료가 없습니다. 낚시를 시작해 대화를 읽으면 검사합니다.'
             self.version += 1
+            if self.recovery_source is not None:
+                text, user, bot = self.recovery_source
+                from history_recovery import recover_missing
+                recover_missing(self, text, user, bot)
+
+    def remember_recovery_source(self, text, user, bot):
+        with self._lock:
+            self.recovery_source = (text, user, bot)
+            if self.recovery_pending:
+                from history_recovery import recover_missing
+                recover_missing(self, text, user, bot)
 
     def discard_response(self, key):
         """Remove an incomplete response when a later counter disproves ownership."""
@@ -361,10 +373,12 @@ class Observer:
     def baseline(self, text):
         LOG.debug("OBSERVER baseline chars=%s user=%r", len(text), self.user)
         self.previous = messages(text)
+        self.history.remember_recovery_source(text, self.user, self.bot)
 
     def observe(self, text):
         self.observed_catch = False
         self._observe(text)
+        self.history.remember_recovery_source(text, self.user, self.bot)
         if self.observed_catch:
             from history_recovery import recover_missing
             recover_missing(self.history, text, self.user, self.bot)

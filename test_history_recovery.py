@@ -33,6 +33,80 @@ def seed(history, count, balance, **extra):
                                          user='나', time=DAY + 'T13:00:00+09:00', **extra))
 
 
+class UnidentifiedSpeciesRecoveryTests(unittest.TestCase):
+    def history(self, path=None):
+        history = History(path)
+        seed(history, 777, 110, exp=5, individual_session=True)
+        return history
+
+    def test_updates_existing_id_and_persists_without_duplicating_rewards(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as folder:
+            path = Path(folder) / 'history.csv'
+            history = self.history(path)
+            before = history.snapshot()[0]
+            history.request_recovery()
+            recover_missing(history, DATE + '\n' + catch(777, 110), '나', '봇')
+            rows = history.snapshot()
+            self.assertEqual(len(rows), 1)
+            for field in ('id', 'time', 'gold', 'exp', 'balance', 'today', 'individual_session'):
+                self.assertEqual(rows[0][field], before[field])
+            self.assertEqual((rows[0]['species'], rows[0]['size'], rows[0]['grade']), ('가자미', 10, '일반'))
+            self.assertEqual(load_records(path)[0]['species'], '가자미')
+            self.assertEqual(make_rows(rows, '어종')[0]['species'], '가자미')
+            self.assertIn('어종 1건 확인', history.recovery_status)
+            history.request_recovery()
+            recover_missing(history, DATE + '\n' + catch(777, 110), '나', '봇')
+            self.assertEqual(history.snapshot(), rows)
+
+    def test_foreign_conflicting_undated_or_wrong_phase_candidates_are_ignored(self):
+        for chat in (DATE + '\n' + catch(777, 110, owner='친구'),
+                     DATE + '\n' + catch(777, 999),
+                     catch(777, 110),
+                     DATE + '\n' + catch(777, 110).replace('오늘 낚시:', '추가 낚시:')):
+            with self.subTest(chat=chat):
+                history = self.history()
+                history.request_recovery()
+                recover_missing(history, chat, '나', '봇')
+                self.assertNotIn('species', history.snapshot()[0])
+
+    def test_conflicting_species_are_not_guessed(self):
+        history = self.history()
+        history.request_recovery()
+        chat = DATE + '\n' + catch(777, 110) + '\n' + catch(777, 110, owner='').replace('가자미', '우럭')
+        recover_missing(history, chat, '나', '봇')
+        self.assertNotIn('species', history.snapshot()[0])
+
+    def test_explicit_unknown_label_is_replaced(self):
+        history = self.history()
+        history.update(1, {'species': '어종 미확인'})
+        history.request_recovery()
+        recover_missing(history, DATE + '\n' + catch(777, 110), '나', '봇')
+        self.assertEqual(history.snapshot()[0]['species'], '가자미')
+
+    def test_loaded_unknown_is_updated_by_button_request_while_paused(self):
+        with tempfile.TemporaryDirectory(dir=Path(__file__).parent) as folder:
+            path = Path(folder) / 'history.csv'
+            self.history(path)
+            history = History.load(path)
+            history.path = path  # simulate the writable live daily history
+            observer = Observer(history, '나')
+            observer.baseline(DATE + '\n' + catch(777, 110))
+            self.assertNotIn('species', history.snapshot()[0])
+            history.request_recovery()  # no observe/new fishing after this click
+            self.assertFalse(history.recovery_pending)
+            self.assertEqual(history.snapshot()[0]['species'], '가자미')
+            self.assertEqual(load_records(path)[0]['species'], '가자미')
+            self.assertEqual(len(history.snapshot()), 1)
+
+    def test_request_before_first_capture_runs_on_baseline(self):
+        history = self.history()
+        history.request_recovery()
+        self.assertTrue(history.recovery_pending)
+        Observer(history, '나').baseline(DATE + '\n' + catch(777, 110))
+        self.assertFalse(history.recovery_pending)
+        self.assertEqual(history.snapshot()[0]['species'], '가자미')
+
+
 class RecoveryTests(unittest.TestCase):
     def setUp(self):
         self.h = History()
@@ -169,14 +243,11 @@ class RecoveryTests(unittest.TestCase):
         chat = chat.replace('자동어 출현!', '현무의 잔향을 마주쳤어요.\n잔향 보상: 10G')
         self.assertEqual(dated_candidates(chat, '나', '봇', DAY)[-1]['today'], 3000)
 
-    def test_observer_waits_for_next_fishing_capture(self):
+    def test_request_uses_baseline_immediately_without_new_fishing(self):
         obs = Observer(self.h, '나')
         chat = DATE + '\n' + catch(777, 110)
         obs.baseline(chat)
         self.h.request_recovery()
-        obs.observe(chat)
-        self.assertTrue(self.h.recovery_pending)
-        obs.observe(chat + '\n' + catch(779, 130))
         self.assertFalse(self.h.recovery_pending)
         self.assertTrue(any(r.get('recovered') for r in self.h.snapshot()))
 

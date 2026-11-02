@@ -122,6 +122,10 @@ def recover_missing(history, text, user, bot):
         records = history.snapshot()
         runs = missing_runs(records, user, day)
         requested = history.recovery_pending
+        unidentified = [r for r in records if requested and r.get('user') == user
+                        and r['time'][:10] == day and r.get('kind') == 'fish'
+                        and r.get('species') in (None, '', '어종 미확인')
+                        and r.get('today') is not None]
         targets = [(lo, hi) for lo, hi in runs if requested or
                    any((day, user, n) not in history.recovery_attempted for n in range(lo, hi + 1))]
         if not requested and not targets:
@@ -130,7 +134,41 @@ def recover_missing(history, text, user, bot):
         history.recovery_pending = False
         for lo, hi in targets:
             history.recovery_attempted.update((day, user, n) for n in range(lo, hi + 1))
-        candidates = dated_candidates(text, user, bot, day) if targets else []
+        candidates = dated_candidates(text, user, bot, day) if targets or unidentified else []
+        updated = 0
+        for record in unidentified:
+            phase = record.get('phase', 'daily')
+            peers = [r for r in records if r.get('user') == user and r['time'][:10] == day
+                     and r.get('kind') == 'fish' and r.get('today') == record['today']
+                     and r.get('phase', 'daily') == phase]
+            if len(peers) != 1:
+                continue
+            matches = {}
+            for candidate in candidates:
+                if (candidate.get('kind') != 'fish' or not candidate.get('species')
+                        or candidate.get('today') != record['today']
+                        or candidate.get('phase', 'daily') != phase
+                        or candidate.get('user') not in ('', user)):
+                    continue
+                if any(record.get(key) is not None and candidate.get(key) is not None
+                       and record[key] != candidate[key] for key in ('balance', 'gold', 'exp', 'limit')):
+                    continue
+                # An ownerless card needs the existing balance as independent evidence.
+                if not candidate.get('user') and (record.get('balance') is None
+                                                 or candidate.get('balance') != record['balance']):
+                    continue
+                signature = tuple(sorted((k, str(v)) for k, v in candidate.items() if k not in ('id', 'time')))
+                matches[signature] = candidate
+            if len(matches) != 1:
+                continue
+            candidate = next(iter(matches.values()))
+            details = {'species': candidate['species']}
+            details.update({key: candidate[key] for key in ('size', 'grade', 'collection')
+                            if key in candidate and record.get(key) in (None, '')})
+            # Preserve identity, timestamp, rewards and count. Updating the same
+            # ID also persists the correction and refreshes grouped UI totals.
+            history.update(record['id'], details)
+            updated += 1
         added = 0
         for lo, hi in targets:
             anchors = [r for r in records if r.get('user') == user and r['time'][:10] == day and
@@ -170,6 +208,11 @@ def recover_missing(history, text, user, bot):
                 history.update(history.new_id(), recovered)
                 added += 1
         history.recovery_status = f'누락 검사 완료: {added}건 복구'
+        if requested:
+            history.recovery_status += f' · 어종 {updated}건 확인'
+            unresolved = len(unidentified) - updated
+            if unresolved:
+                history.recovery_status += f' · 어종 미확인 {unresolved}건 남음'
         remaining = sum(hi - lo + 1 for lo, hi in missing_runs(history.snapshot(), user, day))
         if remaining:
             history.recovery_status += f' · {remaining}건 미복구 (오늘 날짜·카운트·소유자/골드 근거 부족)'

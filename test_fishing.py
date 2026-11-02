@@ -331,15 +331,17 @@ class ObserverTests(unittest.TestCase):
 
 
 class IntegrationTests(unittest.TestCase):
-    def test_copy_restores_input_focus_before_waiting_for_clipboard(self):
+    def test_copy_synchronizes_list_and_restores_edit_only_after_copy(self):
         # Real Kakao reproduction: queued copy completes at focus reattachment,
         # not while the macro is just sleeping and polling the sequence number.
         state = {'sequence': 1, 'text': 'previous clipboard', 'copy_requested': False}
 
         def focus(handle):
-            if handle == 20 and state['copy_requested']:
+            if handle == 10 and state['copy_requested']:
                 state['sequence'] = 2
                 state['text'] = COPIED_CHAT
+            if handle == 20:
+                self.assertEqual(state['sequence'], 2)
             return True
 
         def keys(*vks):
@@ -352,6 +354,8 @@ class IntegrationTests(unittest.TestCase):
             return state['text']
 
         with patch.object(macro, 'find_child', side_effect=[10, 20]), \
+             patch.object(macro, 'modifiers_held', return_value=False), \
+             patch.object(macro, 'control_has_focus', return_value=True), \
              patch.object(macro, 'GetForegroundWindow', return_value=1), \
              patch.object(macro, 'get_clipboard_text', side_effect=lambda: state['text']), \
              patch.object(macro, 'GetClipboardSequenceNumber', side_effect=lambda: state['sequence']), \
@@ -492,7 +496,7 @@ class IntegrationTests(unittest.TestCase):
         app._update_shutdown_policy()
         self.assertIsNone(app._shutdown_at)
 
-    def test_reply_reads_during_wait_and_records_later_card(self):
+    def test_first_reply_found_skips_second_copy(self):
         import threading
         job=macro.MacroJob.__new__(macro.MacroJob)
         job._last_enter=0.0; job._stop_event=threading.Event()
@@ -517,8 +521,8 @@ class IntegrationTests(unittest.TestCase):
             reply=job._await_reply()
         self.assertEqual(reply[0],'success')
         self.assertAlmostEqual(reads[0],0.5)
-        self.assertLess(observed[0],macro.WAIT_S)
-        self.assertGreater(len(reads),1)
+        self.assertEqual(observed, [])
+        self.assertEqual(reads, [0.5])
         self.assertAlmostEqual(clock[0],macro.WAIT_S)
 
     def test_slow_copy_uses_remaining_budget_without_extra_wait(self):
@@ -540,10 +544,11 @@ class IntegrationTests(unittest.TestCase):
         with patch.object(macro.time,'perf_counter',side_effect=lambda:clock[0]), patch.object(macro,'copy_chat',side_effect=copy), patch.object(macro,'GetForegroundWindow',return_value=1):
             self.assertEqual(job._await_reply(),())
         self.assertAlmostEqual(copies[0][0],0.5)
+        self.assertEqual([start for start, end in copies], [0.5, 2.5])
         self.assertTrue(all(end<=2.8 for _,end in copies))
         self.assertAlmostEqual(clock[0],3.0)
 
-    def test_four_second_command_cycle(self):
+    def test_command_gaps_start_after_typing_completes(self):
         import threading
         job=macro.MacroJob.__new__(macro.MacroJob)
         job._stop_event=threading.Event(); job.target=1; job.user='나'
@@ -554,7 +559,7 @@ class IntegrationTests(unittest.TestCase):
             return False
         def send(text):
             events.append((text,clock[0]))
-            clock[0]+=0.02  # typing time is included in the half-second slot
+            clock[0]+=0.02
             return True
         def enter(text):
             events.append(('Enter',clock[0]))
@@ -565,11 +570,11 @@ class IntegrationTests(unittest.TestCase):
         with patch.object(macro.time,'perf_counter',side_effect=lambda:clock[0]), patch.object(macro,'copy_chat',return_value=None), patch.object(macro,'GetForegroundWindow',return_value=1):
             self.assertTrue(job._command('낚시'))
             job._await_reply()
-            self.assertAlmostEqual(clock[0],4.0)
+            self.assertAlmostEqual(clock[0],4.07)
         self.assertEqual(events[0],('@',0.0))
-        self.assertEqual(events[1],('Enter',0.5))
-        self.assertAlmostEqual(events[2][1],0.53)
-        self.assertEqual(events[3],('Enter',1.0))
+        self.assertEqual(events[1],('Enter',0.52))
+        self.assertAlmostEqual(events[2][1],0.55)
+        self.assertAlmostEqual(events[3][1],1.07)
 
     def test_bait_caps(self):
         for available, maximum, expected in [(30, 10, 10), (30, 20, 20), (7, 20, 7), (0, 20, 0)]:
