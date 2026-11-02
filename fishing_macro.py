@@ -35,7 +35,7 @@ from fishing_history import DailyHistory, History, Observer, CatchCounters, now_
 from history_window import HistoryWindow
 
 APP_TITLE = "낚시 매크로"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 MENTION_TRACE = None
 ICON_FILE = "fishing.ico"
 ROOM_PREFIX = "낚시"            # 이 글자로 시작하는 카톡 채팅방을 찾음
@@ -965,7 +965,15 @@ class MacroJob:
                 if not text:
                     continue
                 self._last_chat = text
+                auto_before = self.observer.auto_version
                 self.observer.observe(text)
+                if self.observer.auto_version != auto_before:
+                    # A newly observed own auto warning is a control event, not
+                    # a historical counter match. Never discard it at the
+                    # replay/current-command gates below.
+                    LOG.warning('AUTO control uses fresh observer signal version=%s', self.observer.auto_version)
+                    reply = ('auto',)
+                    break
                 if hasattr(self, '_reply_baseline') and not self._current_command_seen:
                     self._current_command_seen = has_new_command(self._reply_baseline, text, self.user)
                     if not self._current_command_seen:

@@ -368,6 +368,7 @@ class Observer:
         self.bag_count = None
         self.bag_version = 0
         self.awaiting_baseline = False
+        self.auto_version = 0
         self.counters = CatchCounters()
 
     def baseline(self, text):
@@ -418,6 +419,8 @@ class Observer:
         if command:
             LOG.debug("CHAT command sender=%r body=%r", sender, body)
             self.bot = command[1]
+            if command[2] == '낚시':
+                self.pending = deque(p for p in self.pending if not (p[0] == sender and p[1] == '수동'))
             self.pending.append((sender, command[2], self.history.new_id()))
             return
         if sender != self.bot:
@@ -478,6 +481,10 @@ class Observer:
             return
         if not data:
             return
+        if data.get('kind') == 'auto' and owner == self.user and not context.get('auto_notified'):
+            context['auto_notified'] = True
+            self.auto_version += 1
+            LOG.warning('AUTO current user observed key=%s version=%s', key, self.auto_version)
         if data.get('kind') in ('fish', 'pearl', 'auto', 'raid'):
             self.observed_catch = True
         if "today" in data:
